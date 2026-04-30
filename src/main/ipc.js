@@ -2,6 +2,7 @@ import { ipcMain, desktopCapturer, screen, shell, dialog } from 'electron'
 import {
   startNewSession,
   appendChunk,
+  appendWebcamChunk,
   finalizeSession,
   discardSession
 } from './fileWriter.js'
@@ -41,14 +42,15 @@ export function registerIpcHandlers(getWindow) {
     }
   })
 
-  ipcMain.handle('start-recording', async (_e, { sourceId, screenSize }) => {
+  ipcMain.handle('start-recording', async (_e, { sourceId, screenSize, withCamera }) => {
     activeScreenSize = screenSize || activeScreenSize
-    const session = await startNewSession()
+    const session = await startNewSession({ withCamera: !!withCamera })
     recordStartMs = Date.now()
     startTracking(recordStartMs, activeScreenSize.w, activeScreenSize.h)
     return {
       sessionId: session.id,
       videoPath: session.videoPath,
+      webcamPath: session.webcamPath,
       recordStart: recordStartMs,
       mouseTrackerAvailable: mouseTrackerAvailable()
     }
@@ -56,6 +58,10 @@ export function registerIpcHandlers(getWindow) {
 
   ipcMain.handle('write-chunk', async (_e, buffer) => {
     return appendChunk(buffer)
+  })
+
+  ipcMain.handle('write-webcam-chunk', async (_e, buffer) => {
+    return appendWebcamChunk(buffer)
   })
 
   ipcMain.handle('stop-recording', async () => {

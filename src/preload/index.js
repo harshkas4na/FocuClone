@@ -4,11 +4,12 @@ const api = {
   getSources: () => ipcRenderer.invoke('get-sources'),
   getScreenSize: () => ipcRenderer.invoke('get-screen-size'),
 
-  startRecording: (sourceId, screenSize) =>
-    ipcRenderer.invoke('start-recording', { sourceId, screenSize }),
+  startRecording: (sourceId, screenSize, withCamera) =>
+    ipcRenderer.invoke('start-recording', { sourceId, screenSize, withCamera }),
   stopRecording: () => ipcRenderer.invoke('stop-recording'),
   cancelRecording: () => ipcRenderer.invoke('cancel-recording'),
   writeChunk: (buffer) => ipcRenderer.invoke('write-chunk', buffer),
+  writeWebcamChunk: (buffer) => ipcRenderer.invoke('write-webcam-chunk', buffer),
 
   processVideo: (session, opts) => ipcRenderer.invoke('process-video', { session, opts }),
   openInFinder: (filePath) => ipcRenderer.invoke('open-in-finder', filePath),

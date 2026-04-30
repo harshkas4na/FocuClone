@@ -4,12 +4,17 @@ import { useSession } from '../store/useSession.js'
 export default function Recorder() {
   const source = useSession((s) => s.source)
   const micEnabled = useSession((s) => s.micEnabled)
+  const micDeviceId = useSession((s) => s.micDeviceId)
+  const cameraEnabled = useSession((s) => s.cameraEnabled)
+  const cameraDeviceId = useSession((s) => s.cameraDeviceId)
   const goto = useSession((s) => s.goto)
   const setSession = useSession((s) => s.setSession)
 
   const videoRef = useRef(null)
   const recorderRef = useRef(null)
   const previewStreamRef = useRef(null)
+  const webcamRecorderRef = useRef(null)
+  const webcamStreamRef = useRef(null)
 
   const [phase, setPhase] = useState('idle') // idle | countdown | recording | stopping
   const [elapsedMs, setElapsedMs] = useState(0)
@@ -107,7 +112,14 @@ export default function Recorder() {
       let micStream = null
       if (micEnabled) {
         try {
-          micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+          const audioConstraint =
+            micDeviceId && micDeviceId !== 'default'
+              ? { deviceId: { exact: micDeviceId } }
+              : true
+          micStream = await navigator.mediaDevices.getUserMedia({
+            audio: audioConstraint,
+            video: false
+          })
         } catch (err) {
           console.warn('mic failed', err)
         }
@@ -121,10 +133,31 @@ export default function Recorder() {
         videoRef.current.srcObject = combined
       }
 
-      const init = await window.electronAPI.startRecording(source.id, {
-        w: screenW,
-        h: screenH
-      })
+      // Open the webcam stream now (before kicking off the screen recorder)
+      // so both pipelines start within a few ms of each other.
+      let webcamStream = null
+      if (cameraEnabled) {
+        try {
+          const camConstraint =
+            cameraDeviceId && cameraDeviceId !== 'default'
+              ? { deviceId: { exact: cameraDeviceId } }
+              : true
+          webcamStream = await navigator.mediaDevices.getUserMedia({
+            video: camConstraint,
+            audio: false
+          })
+          webcamStreamRef.current = webcamStream
+        } catch (err) {
+          console.warn('webcam failed', err)
+          setError(`Camera failed: ${err.message || err}`)
+        }
+      }
+
+      const init = await window.electronAPI.startRecording(
+        source.id,
+        { w: screenW, h: screenH },
+        !!webcamStream
+      )
       setHookAvailable(init.mouseTrackerAvailable)
       startedAtRef.current = init.recordStart
 
@@ -167,6 +200,27 @@ export default function Recorder() {
       }
       recorder.start(250)
       recorderRef.current = recorder
+
+      // Webcam recorder runs in parallel with the screen recorder. We pick a
+      // lower bitrate since the PiP target is small.
+      if (webcamStream) {
+        const camRecorder = new MediaRecorder(webcamStream, {
+          mimeType,
+          videoBitsPerSecond: 2_000_000
+        })
+        camRecorder.ondataavailable = async (e) => {
+          if (!e.data || e.data.size === 0) return
+          const buf = await e.data.arrayBuffer()
+          try {
+            await window.electronAPI.writeWebcamChunk(buf)
+          } catch (err) {
+            console.error('writeWebcamChunk failed', err)
+          }
+        }
+        camRecorder.start(250)
+        webcamRecorderRef.current = camRecorder
+      }
+
       setPhase('recording')
     } catch (err) {
       console.error('startRecording', err)
@@ -179,6 +233,13 @@ export default function Recorder() {
     if (!recorderRef.current) return
     setPhase('stopping')
     recorderRef.current.stop()
+    if (webcamRecorderRef.current && webcamRecorderRef.current.state !== 'inactive') {
+      try { webcamRecorderRef.current.stop() } catch {}
+    }
+    if (webcamStreamRef.current) {
+      webcamStreamRef.current.getTracks().forEach((t) => t.stop())
+      webcamStreamRef.current = null
+    }
     if (videoRef.current?.srcObject) {
       videoRef.current.srcObject.getTracks().forEach((t) => t.stop())
     }
@@ -189,6 +250,13 @@ export default function Recorder() {
       try {
         recorderRef.current.stop()
       } catch {}
+    }
+    if (webcamRecorderRef.current && webcamRecorderRef.current.state !== 'inactive') {
+      try { webcamRecorderRef.current.stop() } catch {}
+    }
+    if (webcamStreamRef.current) {
+      webcamStreamRef.current.getTracks().forEach((t) => t.stop())
+      webcamStreamRef.current = null
     }
     if (videoRef.current?.srcObject) {
       videoRef.current.srcObject.getTracks().forEach((t) => t.stop())

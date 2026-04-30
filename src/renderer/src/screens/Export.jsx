@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { useSession } from '../store/useSession.js'
+import { findBackground, aspectRatioOf } from '../lib/backgrounds.js'
 
 const QUALITY_PRESETS = {
   high: { label: 'High (CRF 18)', crf: 18 },
@@ -11,6 +12,8 @@ export default function Export() {
   const session = useSession((s) => s.session)
   const exportSettings = useSession((s) => s.exportSettings)
   const updateExportSettings = useSession((s) => s.updateExportSettings)
+  const zooms = useSession((s) => s.zooms)
+  const trim = useSession((s) => s.trim)
   const goto = useSession((s) => s.goto)
   const exportResult = useSession((s) => s.exportResult)
   const setExportResult = useSession((s) => s.setExportResult)
@@ -46,10 +49,20 @@ export default function Export() {
     setPhase('running')
     setProgress(0)
     setLogTail('')
+    const bg = findBackground(exportSettings.backgroundValue)
     const opts = {
       ...exportSettings,
       quality: QUALITY_PRESETS[qualityKey].crf,
-      useVideoToolbox: encoder === 'videotoolbox'
+      useVideoToolbox: encoder === 'videotoolbox',
+      // Pre-resolved background descriptor so the main process doesn't need
+      // to duplicate the catalogue.
+      bgFfmpeg: bg.ffmpeg,
+      canvasAspectRatio: aspectRatioOf(
+        exportSettings.canvasAspect,
+        session.screenW && session.screenH ? session.screenW / session.screenH : 16 / 9
+      ),
+      zooms,
+      trim // { inMs, outMs } — null/undefined means no trim
     }
     const res = await window.electronAPI.processVideo(session, opts)
     if (res.ok) {
