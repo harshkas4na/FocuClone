@@ -1,0 +1,56 @@
+{
+  "name": "focuclone",
+  "version": "0.1.0",
+  "description": "Personal Mac screen recorder with auto-zoom on click",
+  "main": "out/main/index.js",
+  "author": "harsh",
+  "private": true,
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview",
+    "pack": "electron-vite build && electron-builder --dir",
+    "dist": "electron-vite build && electron-builder"
+  },
+  "dependencies": {
+    "electron-store": "^8.2.0",
+    "ffmpeg-static": "^5.2.0",
+    "fluent-ffmpeg": "^2.1.2",
+    "uiohook-napi": "^1.5.4",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.19",
+    "electron": "^29.4.6",
+    "electron-builder": "^24.13.3",
+    "electron-vite": "^2.3.0",
+    "postcss": "^8.4.39",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwindcss": "^3.4.4",
+    "vite": "^5.3.3",
+    "zustand": "^4.5.4"
+  },
+  "build": {
+    "appId": "dev.harsh.focuclone",
+    "productName": "FocuClone",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "out/**/*",
+      "resources/**/*"
+    ],
+    "extraResources": [
+      "resources"
+    ],
+    "mac": {
+      "category": "public.app-category.video",
+      "entitlements": "build/entitlements.mac.plist",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "identity": null
+    }
+  }
+}
