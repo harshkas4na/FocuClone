@@ -1,9 +1,14 @@
 import React, { useRef } from 'react'
 
-export default function Timeline({ events, durationMs, currentMs, onSeek }) {
+export default function Timeline({
+  events,
+  durationMs,
+  currentMs,
+  onSeek,
+  clickWindows = []
+}) {
   const trackRef = useRef(null)
   const clicks = (events || []).filter((e) => e.type === 'click')
-
   const dur = Math.max(durationMs || 1, 1)
   const percent = (ms) => `${Math.min(100, Math.max(0, (ms / dur) * 100))}%`
 
@@ -19,17 +24,29 @@ export default function Timeline({ events, durationMs, currentMs, onSeek }) {
     <div className="select-none">
       <div className="flex items-center justify-between text-xs text-muted mb-2 font-mono">
         <span>{formatTime(currentMs)}</span>
-        <span>{clicks.length} clicks</span>
+        <span>
+          {clicks.length} clicks · {clickWindows.length} zooms
+        </span>
         <span>{formatTime(dur)}</span>
       </div>
       <div
         ref={trackRef}
         onClick={handleTrackClick}
-        className="relative h-12 bg-panel2 rounded cursor-pointer"
+        className="relative h-12 bg-panel2 rounded cursor-pointer overflow-hidden"
       >
+        {clickWindows.map((w, i) => (
+          <div
+            key={`zw-${i}`}
+            className="absolute top-0 bottom-0 bg-accent/15 border-l border-r border-accent/40"
+            style={{
+              left: percent(w.start),
+              width: `${Math.max(0, ((w.end - w.start) / dur) * 100)}%`
+            }}
+          />
+        ))}
         {clicks.map((c, i) => (
           <button
-            key={i}
+            key={`c-${i}`}
             onClick={(e) => {
               e.stopPropagation()
               onSeek?.(c.timestamp)

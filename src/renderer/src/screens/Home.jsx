@@ -4,6 +4,7 @@ import { useSession } from '../store/useSession.js'
 export default function Home() {
   const [sources, setSources] = useState([])
   const [loading, setLoading] = useState(true)
+  const [tab, setTab] = useState('screen')
   const setSource = useSession((s) => s.setSource)
   const setMicEnabled = useSession((s) => s.setMicEnabled)
   const micEnabled = useSession((s) => s.micEnabled)
@@ -23,43 +24,59 @@ export default function Home() {
       }
     }
     load()
+    const t = setInterval(load, 4000) // refresh thumbnails periodically
     return () => {
       cancelled = true
+      clearInterval(t)
     }
   }, [])
 
   const screens = sources.filter((s) => s.id.startsWith('screen:'))
   const windows = sources.filter((s) => s.id.startsWith('window:'))
+  const visible = tab === 'screen' ? screens : windows
 
   return (
-    <div className="h-full overflow-y-auto p-8">
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold">Pick a source</h1>
+    <div className="h-full flex flex-col">
+      <header className="px-8 pt-6 pb-2">
+        <h1 className="text-2xl font-semibold tracking-tight">Pick a source</h1>
         <p className="text-muted text-sm mt-1">
-          Choose a screen or window to record. FocuClone will auto-zoom on every click.
+          FocuClone records the screen and auto-zooms on every click.
         </p>
       </header>
 
-      {loading ? (
-        <div className="text-muted">Loading sources…</div>
-      ) : (
-        <>
-          <SourceGrid
-            title="Screens"
-            sources={screens}
-            selectedId={selectedId}
-            onPick={setSource}
-          />
-          <SourceGrid
-            title="Windows"
-            sources={windows}
-            selectedId={selectedId}
-            onPick={setSource}
-          />
-        </>
-      )}
+      <div className="px-8 mt-2">
+        <div className="inline-flex rounded-lg bg-panel p-1 text-sm">
+          <TabButton active={tab === 'screen'} onClick={() => setTab('screen')}>
+            Screens · {screens.length}
+          </TabButton>
+          <TabButton active={tab === 'window'} onClick={() => setTab('window')}>
+            Windows · {windows.length}
+          </TabButton>
+        </div>
+      </div>
 
-      <div className="mt-8 flex items-center justify-between bg-panel rounded-lg p-4 border border-panel2">
+      <div className="flex-1 overflow-y-auto px-8 py-6">
+        {loading ? (
+          <div className="text-muted">Loading sources…</div>
+        ) : visible.length === 0 ? (
+          <div className="text-muted text-sm">
+            No sources here. Make sure FocuClone has Screen Recording permission.
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
+            {visible.map((s) => (
+              <SourceTile
+                key={s.id}
+                source={s}
+                selected={selectedId === s.id}
+                onPick={setSource}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
+      <footer className="px-8 py-4 border-t border-panel2 bg-panel flex items-center justify-between">
         <label className="flex items-center gap-2 text-sm cursor-pointer">
           <input
             type="checkbox"
@@ -72,43 +89,51 @@ export default function Home() {
         <button
           disabled={!selectedId}
           onClick={() => goto('record')}
-          className="px-5 py-2 bg-accent text-black font-medium rounded-md disabled:bg-panel2 disabled:text-muted"
+          className="px-6 py-2 bg-accent text-black font-medium rounded-md disabled:bg-panel2 disabled:text-muted disabled:cursor-not-allowed"
         >
-          Continue
+          Continue →
         </button>
-      </div>
+      </footer>
     </div>
   )
 }
 
-function SourceGrid({ title, sources, selectedId, onPick }) {
-  if (!sources.length) return null
+function TabButton({ active, onClick, children }) {
   return (
-    <section className="mb-8">
-      <h2 className="text-sm uppercase tracking-wider text-muted mb-3">{title}</h2>
-      <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-        {sources.map((s) => (
-          <button
-            key={s.id}
-            onClick={() => onPick(s)}
-            className={`text-left bg-panel rounded-lg overflow-hidden border-2 transition ${
-              selectedId === s.id
-                ? 'border-accent'
-                : 'border-transparent hover:border-panel2'
-            }`}
-          >
-            <div className="aspect-video bg-black flex items-center justify-center">
-              {s.thumbnail && (
-                <img src={s.thumbnail} alt={s.name} className="w-full h-full object-cover" />
-              )}
-            </div>
-            <div className="p-3 flex items-center gap-2">
-              {s.appIcon && <img src={s.appIcon} className="w-4 h-4" alt="" />}
-              <span className="text-sm truncate">{s.name}</span>
-            </div>
-          </button>
-        ))}
+    <button
+      onClick={onClick}
+      className={`px-3 py-1.5 rounded-md transition ${
+        active ? 'bg-panel2 text-white' : 'text-muted hover:text-white'
+      }`}
+    >
+      {children}
+    </button>
+  )
+}
+
+function SourceTile({ source, selected, onPick }) {
+  return (
+    <button
+      onClick={() => onPick(source)}
+      className={`text-left bg-panel rounded-lg overflow-hidden border-2 transition group ${
+        selected ? 'border-accent' : 'border-transparent hover:border-panel2'
+      }`}
+    >
+      <div className="aspect-video bg-black flex items-center justify-center relative">
+        {source.thumbnail && (
+          <img
+            src={source.thumbnail}
+            alt={source.name}
+            className="w-full h-full object-contain"
+          />
+        )}
       </div>
-    </section>
+      <div className="p-2.5 flex items-center gap-2">
+        {source.appIcon && (
+          <img src={source.appIcon} className="w-4 h-4 flex-shrink-0" alt="" />
+        )}
+        <span className="text-sm truncate">{source.name}</span>
+      </div>
+    </button>
   )
 }
