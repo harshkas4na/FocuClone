@@ -23,7 +23,9 @@ function resolveFfmpegPath() {
   return app.isPackaged ? ffmpegPath.replace('app.asar', 'app.asar.unpacked') : ffmpegPath
 }
 
-function resolveCursorPath() {
+function resolveCursorPath(cursorPngPath) {
+  // Renderer-rasterized skin wins. Otherwise fall back to the bundled default.
+  if (cursorPngPath) return cursorPngPath
   return app.isPackaged
     ? join(process.resourcesPath, 'resources', 'cursor.png')
     : join(__dirname, '../../resources/cursor.png')
@@ -91,7 +93,16 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
     micVolume = 1.0,
     audioFadeInMs = 0,
     audioFadeOutMs = 0,
-    audioMuted = false
+    audioMuted = false,
+    cursorSize = 1.0,
+    cursorPngPath = null,
+    roundedMaskPngPath = null,
+    roundedMaskW = 0,
+    roundedMaskH = 0,
+    showKeystrokes = false,
+    keystrokePosition = 'bottom',
+    keystrokeWindowMs = 1500,
+    annotations: annotationOverlays = []
   } = opts
 
   const rawVideoPath = session.videoPath
@@ -156,13 +167,14 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
   const cursorWindows = clickWindowsFromZooms(zooms)
   let cursorAvailable = false
   if (showCursor && cursorWindows.length > 0) {
-    const cursorPath = resolveCursorPath()
+    const cursorPath = resolveCursorPath(cursorPngPath)
     try {
       await fs.access(cursorPath)
       cursorAvailable = true
       extraInputs.push('-i', cursorPath)
+      onLog && onLog(`[processor] cursor: ${cursorPath}\n`)
     } catch {
-      onLog && onLog(`[processor] cursor.png missing, skipping cursor overlay\n`)
+      onLog && onLog(`[processor] cursor PNG missing (${cursorPath}), skipping cursor overlay\n`)
     }
   }
 
@@ -174,9 +186,10 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
       .join('+')
 
     if (cursorFollowsMouse) {
-      // Pre-compute per-frame cursor x,y as sendcmd commands
-      const cursorW = 44
-      const cursorH = 52 // 40x48 SVG scaled to 44 wide preserves ~1.2 ratio
+      // Pre-compute per-frame cursor x,y as sendcmd commands. The size slider
+      // (cursorSize) multiplies the base 44×52 footprint.
+      const cursorW = Math.max(8, Math.round(44 * cursorSize))
+      const cursorH = Math.max(8, Math.round(52 * cursorSize)) // ~1.2 ratio
       const cmds = buildCursorSendcmd({
         zooms,
         decimatedMoves: decimated,
@@ -204,12 +217,84 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
         `${currentLabel}[cur]overlay@ov=x=${Math.round(W / 2)}:y=${Math.round(H / 2)}:eval=frame:enable='${enableExpr}':format=auto[withcur]`
       )
     } else {
-      filterChain.push(`[${cursorIdx}:v]scale=44:-1[cur]`)
+      const fixedCursorW = Math.max(8, Math.round(44 * cursorSize))
+      filterChain.push(`[${cursorIdx}:v]scale=${fixedCursorW}:-1[cur]`)
       filterChain.push(
         `${currentLabel}[cur]overlay=x=(W-w)/2:y=(H-h)/2:enable='${enableExpr}':format=auto[withcur]`
       )
     }
     currentLabel = '[withcur]'
+  }
+
+  // Annotation overlays + blur masks. Each entry is either a PNG to overlay
+  // (text, shapes, spotlight) or a "blur" geometry that we boxblur on the
+  // underlying stream and overlay back. Time windows use trim-relative
+  // seconds via FFmpeg's `enable=between(t, ...)`.
+  for (let i = 0; i < (annotationOverlays || []).length; i++) {
+    const ann = annotationOverlays[i]
+    const startSec = Math.max(0, (ann.start - trimInMs) / 1000)
+    const endSec = Math.max(startSec, (ann.end - trimInMs) / 1000)
+    if (endSec <= 0 || startSec >= outDurSec) continue
+    const enableExpr = `between(t,${startSec.toFixed(3)},${endSec.toFixed(3)})`
+
+    if (ann.kind === 'mask' && ann.maskId === 'blur') {
+      // Crop the region, blur it, overlay back at the same coords. We use
+      // `eval=init` semantics implicitly since the geometry is static; only
+      // the enable window varies.
+      const cw = Math.max(2, Math.round(ann.w * W))
+      const ch = Math.max(2, Math.round(ann.h * H))
+      const cx = Math.round(ann.x * W - cw / 2)
+      const cy = Math.round(ann.y * H - ch / 2)
+      const splitA = `s${i}a`
+      const splitB = `s${i}b`
+      const blurredLabel = `bl${i}`
+      const outLabel = `am${i}`
+      filterChain.push(`${currentLabel}split=2[${splitA}][${splitB}]`)
+      filterChain.push(
+        `[${splitB}]crop=${cw}:${ch}:${Math.max(0, cx)}:${Math.max(0, cy)},boxblur=20:1[${blurredLabel}]`
+      )
+      filterChain.push(
+        `[${splitA}][${blurredLabel}]overlay=x=${Math.max(0, cx)}:y=${Math.max(0, cy)}:enable='${enableExpr}'[${outLabel}]`
+      )
+      currentLabel = `[${outLabel}]`
+      continue
+    }
+
+    // PNG overlay (text / shape / spotlight).
+    if (ann.pngPath) {
+      let available = false
+      try {
+        await fs.access(ann.pngPath)
+        available = true
+      } catch {
+        onLog && onLog(`[processor] annotation PNG missing: ${ann.pngPath}\n`)
+      }
+      if (!available) continue
+      extraInputs.push('-i', ann.pngPath)
+      const idx = nextInputIdx++
+      let scaleW, scaleH, posX, posY
+      if (ann.fullFrame) {
+        scaleW = W
+        scaleH = H
+        posX = 0
+        posY = 0
+      } else {
+        scaleW = Math.max(2, Math.round(ann.w * W))
+        scaleH = Math.max(2, Math.round(ann.h * H))
+        posX = Math.round(ann.x * W - scaleW / 2)
+        posY = Math.round(ann.y * H - scaleH / 2)
+      }
+      const scaledLabel = `as${i}`
+      const outLabel = `ao${i}`
+      filterChain.push(`[${idx}:v]scale=${scaleW}:${scaleH}[${scaledLabel}]`)
+      filterChain.push(
+        `${currentLabel}[${scaledLabel}]overlay=x=${posX}:y=${posY}:enable='${enableExpr}':format=auto[${outLabel}]`
+      )
+      currentLabel = `[${outLabel}]`
+    }
+  }
+  if (annotationOverlays && annotationOverlays.length) {
+    onLog && onLog(`[processor] applied ${annotationOverlays.length} annotations\n`)
   }
 
   // Resolve final output canvas size. If the user picked a non-source aspect
@@ -272,11 +357,44 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
       extraInputs.push('-f', 'lavfi', '-i', `color=size=${canvasW}x${canvasH}:color=0x000000:rate=${fps}`)
     }
     const bgIdx = nextInputIdx++
-    filterChain.push(`${currentLabel}scale=${innerW}:${innerH}[inset]`)
-    filterChain.push(
-      `[${bgIdx}:v]trim=duration=${(outDurSec + 1).toFixed(2)},setpts=PTS-STARTPTS[bg]`
-    )
-    filterChain.push(`[bg][inset]overlay=x=${offX}:y=${offY}:format=auto[composed]`)
+
+    // Optional rounded-corner mask. Renderer rasterized a white-on-transparent
+    // PNG of the rounded rect; we scale it to the inset size and alphamerge it
+    // onto the inner content so the corners go transparent, then overlay onto
+    // the bg as before. Without this the export shows hard rectangular edges
+    // even when the preview shows rounded ones.
+    let roundedMaskAvailable = false
+    let roundedMaskIdx = -1
+    if (roundedMaskPngPath) {
+      try {
+        await fs.access(roundedMaskPngPath)
+        extraInputs.push('-i', roundedMaskPngPath)
+        roundedMaskIdx = nextInputIdx++
+        roundedMaskAvailable = true
+      } catch {
+        onLog && onLog(`[processor] rounded mask PNG missing, falling back to hard corners\n`)
+      }
+    }
+
+    if (roundedMaskAvailable) {
+      filterChain.push(
+        `${currentLabel}scale=${innerW}:${innerH},format=yuva420p[insetRgba]`
+      )
+      filterChain.push(
+        `[${roundedMaskIdx}:v]scale=${innerW}:${innerH},format=gray[maskScaled]`
+      )
+      filterChain.push(`[insetRgba][maskScaled]alphamerge[insetRound]`)
+      filterChain.push(
+        `[${bgIdx}:v]trim=duration=${(outDurSec + 1).toFixed(2)},setpts=PTS-STARTPTS[bg]`
+      )
+      filterChain.push(`[bg][insetRound]overlay=x=${offX}:y=${offY}:format=auto[composed]`)
+    } else {
+      filterChain.push(`${currentLabel}scale=${innerW}:${innerH}[inset]`)
+      filterChain.push(
+        `[${bgIdx}:v]trim=duration=${(outDurSec + 1).toFixed(2)},setpts=PTS-STARTPTS[bg]`
+      )
+      filterChain.push(`[bg][inset]overlay=x=${offX}:y=${offY}:format=auto[composed]`)
+    }
     currentLabel = '[composed]'
   }
 
@@ -359,15 +477,16 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
     }
   }
 
-  // Watermark — drawtext is fontconfig-free when no fontfile is given on
-  // macOS but rendering quality varies; using a generic approach.
+  // Watermark — applied on the inner stream (after cursor + camera, before
+  // bg framing) so it lives inside the inner clip exactly like the preview.
+  // Doing it after letterboxing made it sit on the wallpaper instead.
   if (watermarkEnabled && watermarkText) {
     const safeText = watermarkText
       .replace(/\\/g, '\\\\')
       .replace(/:/g, '\\:')
       .replace(/'/g, "\\'")
+    const margin = Math.round(Math.min(W, H) * 0.04)
     const xy = (() => {
-      const margin = 24
       switch (watermarkPosition) {
         case 'top-left': return `x=${margin}:y=${margin}`
         case 'top-right': return `x=w-tw-${margin}:y=${margin}`
@@ -375,11 +494,79 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
         default: return `x=w-tw-${margin}:y=h-th-${margin}`
       }
     })()
+    // Editor watermark size is in CSS px on a typical ~600-tall inner clip;
+    // scale to actual export height so it stays proportional.
+    const fontSize = Math.max(10, Math.round((watermarkSize / 600) * H))
     const alpha = Math.max(0, Math.min(1, watermarkOpacity)).toFixed(2)
     filterChain.push(
-      `${currentLabel}drawtext=text='${safeText}':fontcolor=white@${alpha}:fontsize=${Math.round(watermarkSize)}:${xy}:shadowcolor=black@0.5:shadowx=1:shadowy=1[wm]`
+      `${currentLabel}drawtext=text='${safeText}':fontcolor=white@${alpha}:fontsize=${fontSize}:${xy}:shadowcolor=black@0.5:shadowx=1:shadowy=1[wm]`
     )
     currentLabel = '[wm]'
+  }
+
+  // Keystroke overlay. We draw one drawtext per captured keydown event with
+  // an `enable` window matching the linger; multiple simultaneous keys are
+  // staggered horizontally via a slot allocator so they don't sit on top of
+  // each other.
+  if (showKeystrokes) {
+    const keys = (session.events || []).filter((e) => e.type === 'key')
+    // Translate event timestamps into output-timeline seconds, dropping any
+    // outside the trim window.
+    const trimmed = keys
+      .filter((k) => k.timestamp >= trimInMs && k.timestamp <= trimOutMs)
+      .map((k) => ({ ...k, tSec: (k.timestamp - trimInMs) / 1000 }))
+      .sort((a, b) => a.tSec - b.tSec)
+
+    if (trimmed.length > 0) {
+      const windowS = Math.max(0.1, keystrokeWindowMs / 1000)
+      // slotFreeAt[i] = earliest tSec at which slot i becomes available
+      const slotFreeAt = []
+      const SLOT_W = 90 // px between key chips
+      const fontSize = Math.max(20, Math.round(canvasH * 0.04))
+      const yExpr =
+        keystrokePosition === 'top'
+          ? `${Math.round(canvasH * 0.08)}`
+          : `h-th-${Math.round(canvasH * 0.08)}`
+
+      for (const k of trimmed) {
+        // Find the lowest-indexed free slot; otherwise add a new one.
+        let slot = 0
+        while (slot < slotFreeAt.length && slotFreeAt[slot] > k.tSec) slot++
+        if (slot >= slotFreeAt.length) slotFreeAt.push(0)
+        slotFreeAt[slot] = k.tSec + windowS
+
+        // Symmetric layout: slots 0,1,2,3,4 → offsets 0, +SLOT_W, -SLOT_W, +2W, -2W
+        const half = Math.floor((slot + 1) / 2)
+        const sign = slot === 0 ? 0 : slot % 2 === 1 ? 1 : -1
+        const xOffset = sign * half * SLOT_W
+
+        // Render label with modifier glyphs prefixed.
+        const parts = []
+        if (k.meta) parts.push('CMD')
+        if (k.ctrl) parts.push('CTRL')
+        if (k.alt) parts.push('ALT')
+        if (k.shift && k.label.length > 1) parts.push('SHIFT')
+        parts.push(k.label.length === 1 ? k.label.toUpperCase() : k.label)
+        const text = parts.join(' ')
+          .replace(/\\/g, '\\\\')
+          .replace(/:/g, '\\:')
+          .replace(/'/g, "\\'")
+
+        const enableExpr = `between(t,${k.tSec.toFixed(3)},${(k.tSec + windowS).toFixed(3)})`
+        const xExpr = xOffset === 0
+          ? `(w-tw)/2`
+          : `(w-tw)/2${xOffset > 0 ? '+' : ''}${xOffset}`
+
+        filterChain.push(
+          `${currentLabel}drawtext=text='${text}':fontcolor=white:fontsize=${fontSize}:` +
+            `box=1:boxcolor=black@0.7:boxborderw=10:` +
+            `x='${xExpr}':y='${yExpr}':` +
+            `enable='${enableExpr}'[k${slot}_${k.tSec.toFixed(3).replace('.', '_')}]`
+        )
+        currentLabel = `[k${slot}_${k.tSec.toFixed(3).replace('.', '_')}]`
+      }
+      onLog && onLog(`[processor] keystroke overlay: ${trimmed.length} key chips\n`)
+    }
   }
 
   filterChain.push(`${currentLabel}format=yuv420p[final]`)

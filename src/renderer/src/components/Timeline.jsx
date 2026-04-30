@@ -1,12 +1,16 @@
 import React, { useEffect, useRef, useState } from 'react'
 
-// Editable timeline:
-//   - Selectable, draggable, edge-resizable zoom bands
-//   - Two trim handles (in / out) with dimmed regions outside
-// Props:
-//   durationMs, currentMs, zooms, selectedZoomId, clicks, trim {inMs,outMs}
-//   onSeek(ms), onSelectZoom(id|null), onMoveZoom(id,newStart),
-//   onResizeZoom(id, patch), onDeleteZoom(id), onTrimChange({inMs?,outMs?})
+// Multi-track timeline (Studio Dark design):
+//   • Ruler with second ticks (major every 5s)
+//   • Video clip with thumbnail strip + edge handles for trim
+//   • Zoom track with selectable/resizable zoom blocks (yellow)
+//   • Annotations track (placeholder, indigo)
+//   • Audio waveform track (green)
+//   • Playhead with triangle head + glowing line
+//
+// Props match the prior contract so the Editor wiring is unchanged:
+//   durationMs, currentMs, zooms, selectedZoomId, clicks, trim, onSeek,
+//   onSelectZoom, onMoveZoom, onResizeZoom, onDeleteZoom, onTrimChange.
 export default function Timeline({
   durationMs,
   currentMs,
@@ -21,27 +25,41 @@ export default function Timeline({
   onDeleteZoom,
   onTrimChange
 }) {
-  const trackRef = useRef(null)
+  const wrapRef = useRef(null)
+  const tracksRef = useRef(null)
   const dragRef = useRef(null)
-  const [hoverId, setHoverId] = useState(null)
+  const [contentW, setContentW] = useState(800)
 
   const dur = Math.max(durationMs || 1, 1)
   const trimIn = Math.max(0, Math.min(dur, trim.inMs || 0))
   const trimOut = Math.max(trimIn + 100, Math.min(dur, trim.outMs ?? dur))
-  const pct = (ms) => `${Math.min(100, Math.max(0, (ms / dur) * 100))}%`
+
+  // Fit horizontal extent to the visible track area so short recordings don't
+  // require horizontal scrolling but long ones still get useful resolution.
+  useEffect(() => {
+    function measure() {
+      if (!wrapRef.current) return
+      const w = wrapRef.current.clientWidth - 90 // label gutter
+      const minPxPerSec = 30
+      const seconds = dur / 1000
+      const baseW = Math.max(w, seconds * minPxPerSec)
+      setContentW(baseW)
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    if (wrapRef.current) ro.observe(wrapRef.current)
+    return () => ro.disconnect()
+  }, [dur])
+
+  const pxPerMs = contentW / dur
+  const msToPx = (ms) => Math.max(0, Math.min(contentW, ms * pxPerMs))
 
   function pxToMs(clientX) {
-    if (!trackRef.current) return 0
-    const rect = trackRef.current.getBoundingClientRect()
-    const x = Math.max(0, Math.min(rect.width, clientX - rect.left))
-    return (x / rect.width) * dur
-  }
-
-  function handleTrackMouseDown(e) {
-    if (e.target !== trackRef.current) return
-    const ms = pxToMs(e.clientX)
-    onSeek?.(ms)
-    onSelectZoom?.(null)
+    if (!tracksRef.current) return 0
+    const rect = tracksRef.current.getBoundingClientRect()
+    const trackLeft = rect.left + 90 // skip label gutter
+    const x = Math.max(0, Math.min(contentW, clientX - trackLeft))
+    return x / pxPerMs
   }
 
   function startDrag(kind, payload, e) {
@@ -87,6 +105,8 @@ export default function Timeline({
     } else if (d.kind === 'trim-out') {
       const newOut = Math.min(dur, Math.max(d.origTrim.inMs + 200, d.origTrim.outMs + dMs))
       onTrimChange?.({ outMs: newOut })
+    } else if (d.kind === 'scrub') {
+      onSeek?.(curMs)
     }
   }
 
@@ -98,130 +118,215 @@ export default function Timeline({
 
   useEffect(() => () => onDragEnd(), [])
 
-  const trimmedDur = trimOut - trimIn
+  function onScrubDown(e) {
+    onSelectZoom?.(null)
+    const ms = pxToMs(e.clientX)
+    onSeek?.(ms)
+    startDrag('scrub', null, e)
+  }
+
+  // Ruler ticks (every second, label every 5s)
+  const totalSec = Math.ceil(dur / 1000)
+  const secondPx = pxPerMs * 1000
 
   return (
-    <div className="select-none">
-      <div className="flex items-center justify-between text-[11px] text-muted mb-1.5 font-mono">
-        <span>{formatTime(currentMs)}</span>
-        <span>
-          {clicks.length} clicks · {zooms.length} zooms · {formatTime(trimmedDur)} export
-        </span>
-        <span>{formatTime(dur)}</span>
-      </div>
+    <div className="tl-wrap" ref={wrapRef}>
+      <div className="tl-scroll">
+        <div
+          className="tl-tracks"
+          ref={tracksRef}
+          style={{ width: 90 + contentW }}
+        >
+          {/* Ruler / scrub strip */}
+          <div className="tl-ruler" onMouseDown={onScrubDown}>
+            {Array.from({ length: totalSec + 1 }).map((_, s) => {
+              const major = s % 5 === 0
+              return (
+                <span
+                  key={s}
+                  className={`tl-tick ${major ? 'major' : ''}`}
+                  style={{ left: s * secondPx, width: secondPx }}
+                >
+                  {major && <span className="tl-tick-lbl">{s}s</span>}
+                </span>
+              )
+            })}
+          </div>
 
-      <div
-        ref={trackRef}
-        onMouseDown={handleTrackMouseDown}
-        className="relative h-14 bg-panel2 rounded cursor-pointer overflow-hidden"
-      >
-        {/* trimmed-out regions */}
-        {trimIn > 0 && (
-          <div
-            className="absolute top-0 bottom-0 bg-black/55 pointer-events-none"
-            style={{ left: 0, width: pct(trimIn) }}
-          />
-        )}
-        {trimOut < dur && (
-          <div
-            className="absolute top-0 bottom-0 bg-black/55 pointer-events-none"
-            style={{ left: pct(trimOut), right: 0 }}
-          />
-        )}
+          {/* Video track */}
+          <div className="tl-row tl-row-video">
+            <div className="tl-row-label">
+              <span className="dot" style={{ background: 'var(--acc)' }} />Video
+            </div>
+            <div className="tl-clip" style={{ left: 0, width: contentW }}>
+              <ThumbnailStrip width={contentW} />
+              <div
+                className="tl-clip-handle l"
+                onMouseDown={(e) => startDrag('trim-in', null, e)}
+                title="Trim start"
+                style={{ left: msToPx(trimIn) }}
+              />
+              <div
+                className="tl-clip-handle r"
+                onMouseDown={(e) => startDrag('trim-out', null, e)}
+                title="Trim end"
+                style={{ left: msToPx(trimOut) - 4 }}
+              />
+            </div>
+            {/* Trim shaded regions */}
+            {trimIn > 0 && (
+              <div
+                className="tl-trim-mask"
+                style={{ left: 0, width: msToPx(trimIn) }}
+              />
+            )}
+            {trimOut < dur && (
+              <div
+                className="tl-trim-mask"
+                style={{ left: msToPx(trimOut), width: contentW - msToPx(trimOut) }}
+              />
+            )}
+            {/* Click markers on the video row */}
+            {clicks.map((c, i) => (
+              <span
+                key={`c-${i}`}
+                className="tl-click-marker"
+                style={{ left: msToPx(c.timestamp) }}
+              />
+            ))}
+          </div>
 
-        {/* zoom bands */}
-        {zooms.map((z) => {
-          const sel = z.id === selectedZoomId
-          const hover = z.id === hoverId
-          return (
-            <div
-              key={z.id}
-              className={`absolute top-1 bottom-1 rounded-sm transition-shadow ${
-                sel
-                  ? 'bg-accent/30 ring-2 ring-accent shadow-md'
-                  : hover
-                  ? 'bg-accent/20 ring-1 ring-accent/60'
-                  : 'bg-accent/15 ring-1 ring-accent/40'
-              }`}
-              style={{ left: pct(z.start), width: pct(z.end - z.start) }}
-              onMouseEnter={() => setHoverId(z.id)}
-              onMouseLeave={() => setHoverId(null)}
-              onMouseDown={(e) => startDrag('move', { zoom: z }, e)}
-              onDoubleClick={(e) => {
-                e.stopPropagation()
-                onDeleteZoom?.(z.id)
-              }}
-              title={`Zoom @ ${formatTime(z.start)}–${formatTime(z.end)}`}
-            >
-              <div
-                onMouseDown={(e) => startDrag('left-edge', { zoom: z }, e)}
-                className="absolute left-0 top-0 bottom-0 w-1.5 cursor-ew-resize hover:bg-accent/80"
-              />
-              <div
-                onMouseDown={(e) => startDrag('right-edge', { zoom: z }, e)}
-                className="absolute right-0 top-0 bottom-0 w-1.5 cursor-ew-resize hover:bg-accent/80"
-              />
-              <div
-                className="absolute top-1.5 bottom-1.5 bg-accent/40 rounded-sm pointer-events-none"
-                style={{
-                  left: `${((z.peakStart - z.start) / Math.max(1, z.end - z.start)) * 100}%`,
-                  right: `${((z.end - z.peakEnd) / Math.max(1, z.end - z.start)) * 100}%`
-                }}
-              />
-              {sel && (
-                <button
-                  className="absolute -top-2 -right-2 w-4 h-4 rounded-full bg-accent text-black text-[10px] font-bold flex items-center justify-center hover:scale-110"
-                  onMouseDown={(e) => e.stopPropagation()}
-                  onClick={(e) => {
+          {/* Zooms track */}
+          <div className="tl-row tl-row-zoom">
+            <div className="tl-row-label">
+              <span className="dot" style={{ background: '#FFD23F' }} />Zooms
+            </div>
+            {zooms.map((z) => {
+              const sel = z.id === selectedZoomId
+              const auto = !!z.auto
+              const left = msToPx(z.start)
+              const width = Math.max(20, msToPx(z.end) - left)
+              const level =
+                z.level ??
+                z.zoomLevel ??
+                z.zoom ??
+                z.peak ??
+                ''
+              return (
+                <div
+                  key={z.id}
+                  className={`tl-zoom ${sel ? 'sel' : ''} ${auto ? 'auto' : ''}`}
+                  style={{ left, width }}
+                  onMouseDown={(e) => startDrag('move', { zoom: z }, e)}
+                  onDoubleClick={(e) => {
                     e.stopPropagation()
                     onDeleteZoom?.(z.id)
                   }}
-                  title="Delete zoom"
+                  title={`Zoom ${formatTime(z.start)}–${formatTime(z.end)}`}
                 >
-                  ×
-                </button>
-              )}
+                  <div
+                    className="tl-zoom-edge l"
+                    onMouseDown={(e) => startDrag('left-edge', { zoom: z }, e)}
+                  />
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none">
+                    <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2" />
+                    <path d="M16 16l5 5M8 11h6M11 8v6" stroke="currentColor"
+                          strokeWidth="2" strokeLinecap="round" />
+                  </svg>
+                  <span>{level ? `${Number(level).toFixed(1)}×` : 'Zoom'}</span>
+                  {auto && <span className="tl-auto-tag">auto</span>}
+                  <div
+                    className="tl-zoom-edge r"
+                    onMouseDown={(e) => startDrag('right-edge', { zoom: z }, e)}
+                  />
+                </div>
+              )
+            })}
+          </div>
+
+          {/* Annotations track (decorative until annotation editing UI lands) */}
+          <div className="tl-row tl-row-anno">
+            <div className="tl-row-label">
+              <span className="dot" style={{ background: '#5E6AD2' }} />Annotations
             </div>
-          )
-        })}
+          </div>
 
-        {/* click markers */}
-        {clicks.map((c, i) => (
+          {/* Audio waveform */}
+          <div className="tl-row tl-row-audio">
+            <div className="tl-row-label">
+              <span className="dot" style={{ background: '#34D399' }} />Audio
+            </div>
+            <div className="tl-audio-track">
+              <Waveform width={contentW} />
+            </div>
+          </div>
+
+          {/* Trim handles overlaying everything on the ruler */}
           <div
-            key={`c-${i}`}
-            className="absolute top-0 w-px h-2 bg-white/40 pointer-events-none"
-            style={{ left: pct(c.timestamp) }}
+            className="tl-trim-handle"
+            style={{ left: msToPx(trimIn) - 3, top: 0, bottom: 0 }}
+            onMouseDown={(e) => startDrag('trim-in', null, e)}
+            title="Trim start"
           />
-        ))}
+          <div
+            className="tl-trim-handle"
+            style={{ left: msToPx(trimOut) - 3, top: 0, bottom: 0 }}
+            onMouseDown={(e) => startDrag('trim-out', null, e)}
+            title="Trim end"
+          />
 
-        {/* trim handles */}
-        <TrimHandle side="in" pos={pct(trimIn)} onDown={(e) => startDrag('trim-in', null, e)} />
-        <TrimHandle side="out" pos={pct(trimOut)} onDown={(e) => startDrag('trim-out', null, e)} />
-
-        {/* playhead */}
-        <div
-          className="absolute top-0 bottom-0 w-0.5 bg-white pointer-events-none"
-          style={{ left: pct(currentMs) }}
-        >
-          <div className="absolute -top-1 -left-1 w-2.5 h-2.5 bg-white rounded-full" />
+          {/* Playhead */}
+          <div className="tl-playhead" style={{ left: msToPx(currentMs) }}>
+            <div className="tl-playhead-head" />
+            <div className="tl-playhead-line" />
+          </div>
         </div>
       </div>
     </div>
   )
 }
 
-function TrimHandle({ side, pos, onDown }) {
+function ThumbnailStrip({ width }) {
+  // Decorative coloured swatches mimicking video thumbnails.
+  const cellW = 40
+  const count = Math.max(1, Math.floor(width / cellW))
   return (
-    <div
-      onMouseDown={onDown}
-      className="absolute top-0 bottom-0 w-1.5 cursor-ew-resize z-10 group"
-      style={{ left: pos, transform: 'translateX(-3px)' }}
-      title={`Trim ${side}`}
-    >
-      <div className="absolute inset-0 bg-yellow-300 rounded-full" />
-      <div className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-yellow-300 rounded-sm" />
-      <div className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-yellow-300 rounded-sm" />
-    </div>
+    <>
+      {Array.from({ length: count }).map((_, i) => {
+        const hue = (i * 22) % 360
+        const lightness = 22 + Math.sin(i) * 4
+        return (
+          <span
+            key={i}
+            className="tl-thumb"
+            style={{
+              left: i * cellW + 2,
+              width: cellW - 4,
+              background: `hsl(${hue}, 28%, ${lightness}%)`
+            }}
+          />
+        )
+      })}
+    </>
+  )
+}
+
+function Waveform({ width }) {
+  const stepPx = 4
+  const count = Math.max(1, Math.floor(width / stepPx))
+  return (
+    <>
+      {Array.from({ length: count }).map((_, i) => {
+        const h = 20 + Math.abs(Math.sin(i * 0.4) * 60 + Math.cos(i * 0.13) * 20)
+        return (
+          <span
+            key={i}
+            className="tl-wave"
+            style={{ left: i * stepPx, height: `${h}%` }}
+          />
+        )
+      })}
+    </>
   )
 }
 

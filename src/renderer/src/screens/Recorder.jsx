@@ -21,6 +21,7 @@ export default function Recorder() {
   const [countdown, setCountdown] = useState(3)
   const [error, setError] = useState(null)
   const [hookAvailable, setHookAvailable] = useState(true)
+  const [showDiscardModal, setShowDiscardModal] = useState(false)
   const startedAtRef = useRef(0)
   const elapsedTimerRef = useRef(null)
 
@@ -133,8 +134,6 @@ export default function Recorder() {
         videoRef.current.srcObject = combined
       }
 
-      // Open the webcam stream now (before kicking off the screen recorder)
-      // so both pipelines start within a few ms of each other.
       let webcamStream = null
       if (cameraEnabled) {
         try {
@@ -201,8 +200,6 @@ export default function Recorder() {
       recorder.start(250)
       recorderRef.current = recorder
 
-      // Webcam recorder runs in parallel with the screen recorder. We pick a
-      // lower bitrate since the PiP target is small.
       if (webcamStream) {
         const camRecorder = new MediaRecorder(webcamStream, {
           mimeType,
@@ -247,9 +244,7 @@ export default function Recorder() {
 
   async function cancelRecording() {
     if (recorderRef.current && recorderRef.current.state !== 'inactive') {
-      try {
-        recorderRef.current.stop()
-      } catch {}
+      try { recorderRef.current.stop() } catch {}
     }
     if (webcamRecorderRef.current && webcamRecorderRef.current.state !== 'inactive') {
       try { webcamRecorderRef.current.stop() } catch {}
@@ -263,95 +258,213 @@ export default function Recorder() {
     }
     await window.electronAPI.cancelRecording()
     setPhase('idle')
+    setShowDiscardModal(false)
     goto('home')
   }
 
   return (
-    <div className="h-full flex flex-col">
-      <div className="flex-1 flex items-center justify-center p-6 bg-black/40 relative">
-        <video
-          ref={videoRef}
-          autoPlay
-          muted
-          playsInline
-          className="max-w-full max-h-full rounded-lg shadow-2xl"
-        />
-        {phase === 'countdown' && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/60">
-            <div className="text-9xl font-bold text-white">{countdown}</div>
-          </div>
-        )}
-        {phase === 'recording' && (
-          <div className="absolute top-6 left-6 flex items-center gap-2 bg-black/70 px-3 py-1.5 rounded-full">
-            <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse" />
-            <span className="text-sm font-mono">{formatTime(elapsedMs)}</span>
-          </div>
-        )}
+    <div className="flex-1 flex flex-col min-h-0" style={{ background: 'var(--bg-1)' }}>
+      {/* Top bar */}
+      <div
+        className="flex items-center gap-4 flex-shrink-0"
+        style={{
+          height: 44, padding: '0 20px',
+          borderBottom: '1px solid var(--line-1)'
+        }}
+      >
+        <div
+          className="flex items-center gap-2"
+          style={{
+            padding: '5px 10px', background: 'var(--bg-2)',
+            border: '1px solid var(--line-2)', borderRadius: 999, fontSize: 12
+          }}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" style={{ color: 'var(--fg-2)' }}>
+            <rect x="3" y="5" width="18" height="13" rx="2" stroke="currentColor" strokeWidth="1.6" />
+          </svg>
+          <span className="font-medium" style={{ color: 'var(--fg-1)' }}>
+            {source?.name || '—'}
+          </span>
+        </div>
+        {micEnabled && <span className="pill pill-acc"><span className="dot" />MIC</span>}
+        {cameraEnabled && <span className="pill pill-acc"><span className="dot" />CAM</span>}
+        <div className="ml-auto flex gap-1.5">
+          {phase === 'idle' && (
+            <button className="btn btn-quiet btn-sm" onClick={() => goto('home')}>
+              ← Back
+            </button>
+          )}
+        </div>
       </div>
 
-      <footer className="border-t border-panel2 bg-panel p-4">
-        {error && (
-          <div className="mb-3 text-red-400 text-sm bg-red-500/10 px-3 py-2 rounded">
-            {error}
-          </div>
-        )}
-        {!hookAvailable && phase === 'recording' && (
-          <div className="mb-3 text-yellow-400 text-sm bg-yellow-500/10 px-3 py-2 rounded">
-            Mouse tracker hook unavailable — recording will work but auto-zoom will have no clicks to follow.
-          </div>
-        )}
-        <div className="flex items-center justify-between">
-          <div className="text-sm text-muted">
-            Source: <span className="text-white">{source?.name || '—'}</span>
-            {micEnabled && <span className="ml-3 text-accent">● mic</span>}
-          </div>
-          <div className="flex gap-2">
-            {phase === 'idle' && (
-              <>
-                <button
-                  onClick={() => goto('home')}
-                  className="px-4 py-2 rounded-md text-sm border border-panel2 hover:bg-panel2"
-                >
-                  Back
-                </button>
-                <button
-                  onClick={beginCountdown}
-                  className="px-5 py-2 rounded-md bg-accent text-black font-medium text-sm"
-                >
-                  Start Recording
-                </button>
-              </>
-            )}
+      {/* State bar (errors / warnings) */}
+      {(error || (!hookAvailable && phase === 'recording')) && (
+        <div
+          className="flex flex-col gap-2"
+          style={{
+            padding: '10px 20px',
+            borderBottom: '1px solid var(--line-1)',
+            background: 'var(--bg-1)'
+          }}
+        >
+          {error && (
+            <div className="alert alert-err">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2" />
+                <path d="M12 8v5M12 16h.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+              </svg>
+              <div>
+                <div className="alert-title">Recording error</div>
+                <div className="alert-sub">{error}</div>
+              </div>
+            </div>
+          )}
+          {!hookAvailable && phase === 'recording' && (
+            <div className="alert alert-warn">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                <path d="M12 3l9 16H3l9-16z" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+                <path d="M12 10v4M12 17h.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+              </svg>
+              <div>
+                <div className="alert-title">Mouse tracker hook unavailable</div>
+                <div className="alert-sub">
+                  Recording will work but auto-zoom will have no clicks to follow.
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Stage */}
+      <div
+        className="flex-1 flex flex-col min-h-0"
+        style={{ padding: 24, gap: 20 }}
+      >
+        <div className="flex-1 flex items-center justify-center min-h-0">
+          <div className="rec-preview">
+            <video
+              ref={videoRef}
+              autoPlay
+              muted
+              playsInline
+              className="absolute inset-0 w-full h-full object-contain"
+            />
             {phase === 'countdown' && (
-              <button
-                onClick={() => setPhase('idle')}
-                className="px-4 py-2 rounded-md text-sm border border-panel2"
-              >
-                Cancel
-              </button>
+              <div className="rec-countdown">
+                <div className="cd-num" key={countdown}>{countdown}</div>
+                <div className="cd-sub">Get ready</div>
+              </div>
             )}
             {phase === 'recording' && (
               <>
-                <button
-                  onClick={cancelRecording}
-                  className="px-4 py-2 rounded-md text-sm border border-panel2 hover:bg-panel2"
+                <div className="rec-border" />
+                <div
+                  className="absolute top-4 left-4 flex items-center gap-2"
+                  style={{
+                    padding: '5px 10px', background: 'rgba(0,0,0,0.6)',
+                    borderRadius: 999, backdropFilter: 'blur(8px)'
+                  }}
                 >
-                  Discard
-                </button>
-                <button
-                  onClick={stopRecording}
-                  className="px-5 py-2 rounded-md bg-red-500 text-white font-medium text-sm"
-                >
-                  Stop
-                </button>
+                  <span className="pill pill-rec" style={{ height: 'auto', padding: 0, background: 'transparent', border: 0 }}>
+                    <span className="dot" />REC
+                  </span>
+                  <span className="font-mono text-[12px]" style={{ color: '#fff' }}>
+                    {formatTime(elapsedMs)}
+                  </span>
+                </div>
               </>
             )}
             {phase === 'stopping' && (
-              <span className="text-sm text-muted">Finalising…</span>
+              <div
+                className="absolute inset-0 flex flex-col items-center justify-center gap-3.5 text-white font-medium"
+                style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(10px)', zIndex: 4 }}
+              >
+                <div className="spinner" />
+                <div>Finalizing recording…</div>
+              </div>
             )}
           </div>
         </div>
-      </footer>
+
+        {/* Controls */}
+        <div className="flex-shrink-0 flex flex-col items-center gap-3" style={{ minHeight: 80 }}>
+          {phase === 'idle' && (
+            <>
+              <button className="rec-cta" onClick={beginCountdown}>
+                <span className="rec-cta-ring">
+                  <span className="rec-cta-dot" />
+                </span>
+                <span className="rec-cta-label">Start Recording</span>
+                <span
+                  className="font-mono"
+                  style={{
+                    fontSize: 11, padding: '3px 8px',
+                    background: 'var(--bg-3)', borderRadius: 6,
+                    color: 'var(--fg-3)', border: '1px solid var(--line-2)'
+                  }}
+                >⇧⌘R</span>
+              </button>
+              <div className="text-[12px]" style={{ color: 'var(--fg-3)' }}>
+                A 3-second countdown will give you time to focus.
+              </div>
+            </>
+          )}
+          {phase === 'countdown' && (
+            <button className="btn btn-ghost" onClick={() => setPhase('idle')}>
+              Cancel countdown
+            </button>
+          )}
+          {phase === 'recording' && (
+            <div className="flex items-center gap-3.5">
+              <button className="rec-stop-cta" onClick={stopRecording}>
+                <span className="rec-stop-ico">
+                  <span style={{ width: 14, height: 14, background: '#fff', borderRadius: 2 }} />
+                </span>
+                Stop Recording
+              </button>
+              <button
+                className="btn btn-danger"
+                onClick={() => setShowDiscardModal(true)}
+              >
+                Discard
+              </button>
+              <div className="rec-elapsed">
+                <div className="rec-elapsed-num">{formatTime(elapsedMs)}</div>
+                <div className="rec-elapsed-lbl">Elapsed</div>
+              </div>
+            </div>
+          )}
+          {phase === 'stopping' && (
+            <div className="text-[13px]" style={{ color: 'var(--fg-2)' }}>Finalising…</div>
+          )}
+        </div>
+      </div>
+
+      {showDiscardModal && (
+        <div className="modal-scrim" onClick={() => setShowDiscardModal(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-icon danger">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+                <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m1 0v14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V6"
+                      stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+              </svg>
+            </div>
+            <div className="modal-title">Discard recording?</div>
+            <p className="modal-body">
+              This will stop and delete the current recording. You can't undo this.
+            </p>
+            <div className="modal-actions">
+              <button className="btn btn-ghost" onClick={() => setShowDiscardModal(false)}>
+                Keep recording
+              </button>
+              <button className="btn btn-danger" onClick={cancelRecording}>
+                Discard
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

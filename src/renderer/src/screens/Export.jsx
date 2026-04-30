@@ -1,18 +1,23 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { useSession } from '../store/useSession.js'
 import { findBackground, aspectRatioOf } from '../lib/backgrounds.js'
+import {
+  rasterizeCursor,
+  rasterizeRoundedMask,
+  rasterizeAnnotation
+} from '../lib/rasterize.js'
 
-const QUALITY_PRESETS = {
-  high: { label: 'High (CRF 18)', crf: 18 },
-  medium: { label: 'Medium (CRF 23)', crf: 23 },
-  small: { label: 'Small file (CRF 28)', crf: 28 }
-}
+const QUALITY_PRESETS = [
+  { key: 'high',   name: 'High',   crf: 18, sub: 'CRF 18',  size: '~ Large',  best: 'Editing master' },
+  { key: 'medium', name: 'Medium', crf: 23, sub: 'CRF 23',  size: '~ Balanced', best: 'Sharing online' },
+  { key: 'small',  name: 'Small',  crf: 28, sub: 'CRF 28',  size: '~ Small',  best: 'Quick reviews' }
+]
 
 export default function Export() {
   const session = useSession((s) => s.session)
   const exportSettings = useSession((s) => s.exportSettings)
-  const updateExportSettings = useSession((s) => s.updateExportSettings)
   const zooms = useSession((s) => s.zooms)
+  const annotations = useSession((s) => s.annotations)
   const trim = useSession((s) => s.trim)
   const goto = useSession((s) => s.goto)
   const exportResult = useSession((s) => s.exportResult)
@@ -24,6 +29,9 @@ export default function Export() {
   const [logTail, setLogTail] = useState('')
   const [qualityKey, setQualityKey] = useState('medium')
   const [encoder, setEncoder] = useState('videotoolbox')
+  // Default-open so users can see what FFmpeg is doing without hunting for
+  // the toggle. They can still hide it manually.
+  const [showLogs, setShowLogs] = useState(true)
 
   const offProgressRef = useRef(null)
   const offLogRef = useRef(null)
@@ -50,19 +58,139 @@ export default function Export() {
     setProgress(0)
     setLogTail('')
     const bg = findBackground(exportSettings.backgroundValue)
+    const preset = QUALITY_PRESETS.find((p) => p.key === qualityKey)
+
+    let cursorPngPath = null
+    let roundedMaskPngPath = null
+    let roundedMaskW = 0
+    let roundedMaskH = 0
+    try {
+      const cursorBuf = await rasterizeCursor(exportSettings.cursorStyle, 4)
+      const cur = await window.electronAPI.saveTempAsset(
+        `cursor-${exportSettings.cursorStyle}-${Date.now()}.png`,
+        cursorBuf
+      )
+      cursorPngPath = cur.path
+    } catch (err) {
+      console.warn('cursor rasterize failed', err)
+    }
+    if (exportSettings.roundness > 0) {
+      try {
+        // Mirror the processor's canvas/inset math so the mask we rasterize
+        // matches the actual inner-clip rectangle pixel-for-pixel. Using a
+        // canonical 1920-wide canvas as the reference; processor scales it
+        // down to whatever inner size the export ends up with — proportional
+        // scale leaves the radius/short-side ratio intact.
+        const sourceAspect =
+          session.screenW && session.screenH
+            ? session.screenW / session.screenH
+            : 16 / 9
+        const targetAspect = aspectRatioOf(exportSettings.canvasAspect, sourceAspect)
+        const canvasW = 1920
+        const canvasH = Math.round(canvasW / targetAspect)
+        const padPx =
+          (Math.min(canvasW, canvasH) * (exportSettings.padding || 0)) / 100
+        const availW = canvasW - 2 * padPx
+        const availH = canvasH - 2 * padPx
+        let innerW, innerH
+        if (availW / availH > sourceAspect) {
+          innerH = availH
+          innerW = innerH * sourceAspect
+        } else {
+          innerW = availW
+          innerH = innerW / sourceAspect
+        }
+        innerW = Math.round(innerW)
+        innerH = Math.round(innerH)
+        const insetShort = Math.min(innerW, innerH)
+        const baseR = Math.max(
+          0,
+          Math.min(insetShort / 2, Math.round((exportSettings.roundness / 100) * insetShort))
+        )
+        const maskBuf = await rasterizeRoundedMask(innerW, innerH, baseR)
+        const m = await window.electronAPI.saveTempAsset(
+          `mask-rounded-${innerW}x${innerH}-${baseR}-${Date.now()}.png`,
+          maskBuf
+        )
+        roundedMaskPngPath = m.path
+        roundedMaskW = innerW
+        roundedMaskH = innerH
+      } catch (err) {
+        console.warn('rounded mask rasterize failed', err)
+      }
+    }
+
+    // Rasterize each annotation (text + shape) to a PNG sized to its target
+    // pixel footprint inside the inner clip, then ship paths + geometry +
+    // time windows to the processor. Mask annotations (blur/spotlight) are
+    // sent through unrasterized — FFmpeg handles those directly with
+    // boxblur / drawbox so the blur is *of the underlying video*, not a
+    // pre-baked picture.
+    const sourceAspect =
+      session.screenW && session.screenH ? session.screenW / session.screenH : 16 / 9
+    const targetAspect = aspectRatioOf(exportSettings.canvasAspect, sourceAspect)
+    // Use the source canvas (W×H) as our reference for annotation rasterization
+    // since they're applied on the inner stream (pre-letterbox).
+    const refW = session.screenW || 1920
+    const refH = session.screenH || 1080
+    const annotationsForExport = []
+    for (const ann of annotations || []) {
+      try {
+        // Blur + magnifier masks are FFmpeg-side: blur → boxblur on a crop;
+        // magnifier is unimplemented. Spotlight is a dark-with-hole PNG.
+        if (ann.kind === 'mask' && ann.maskId === 'blur') {
+          annotationsForExport.push({
+            kind: 'mask',
+            maskId: 'blur',
+            x: ann.x, y: ann.y, w: ann.w, h: ann.h,
+            start: ann.start, end: ann.end
+          })
+          continue
+        }
+        if (ann.kind === 'mask' && ann.maskId === 'magnifier') {
+          // TODO: implement on export side. Skip for now.
+          continue
+        }
+
+        const rast = await rasterizeAnnotation(ann, refW, refH)
+        if (!rast) continue
+        const saved = await window.electronAPI.saveTempAsset(
+          `ann-${ann.id}-${Date.now()}.png`,
+          rast.buffer
+        )
+        annotationsForExport.push({
+          kind: ann.kind === 'mask' ? 'overlay' : ann.kind,
+          pngPath: saved.path,
+          // `fullFrame` overlays cover the whole inner stream (spotlight);
+          // others are positioned at the annotation's center.
+          fullFrame: !!rast.fullFrame,
+          x: ann.x,
+          y: ann.y,
+          w: ann.w,
+          h: ann.h,
+          pngW: rast.w,
+          pngH: rast.h,
+          start: ann.start,
+          end: ann.end
+        })
+      } catch (err) {
+        console.warn('annotation rasterize failed', ann, err)
+      }
+    }
+
     const opts = {
       ...exportSettings,
-      quality: QUALITY_PRESETS[qualityKey].crf,
+      quality: preset.crf,
       useVideoToolbox: encoder === 'videotoolbox',
-      // Pre-resolved background descriptor so the main process doesn't need
-      // to duplicate the catalogue.
       bgFfmpeg: bg.ffmpeg,
-      canvasAspectRatio: aspectRatioOf(
-        exportSettings.canvasAspect,
-        session.screenW && session.screenH ? session.screenW / session.screenH : 16 / 9
-      ),
+      canvasAspectRatio: targetAspect,
+      cursorPngPath,
+      roundedMaskPngPath,
+      roundedMaskW,
+      roundedMaskH,
+      annotations: annotationsForExport,
       zooms,
-      trim // { inMs, outMs } — null/undefined means no trim
+      trim
     }
     const res = await window.electronAPI.processVideo(session, opts)
     if (res.ok) {
@@ -74,159 +202,311 @@ export default function Export() {
     }
   }
 
+  const stages = ['Prepare', 'Render', 'Encode', 'Finalize']
+  const stageIdx = Math.min(stages.length - 1, Math.floor((progress / 100) * stages.length))
+
   return (
-    <div className="h-full flex flex-col p-8 max-w-3xl mx-auto w-full">
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold">Export</h1>
-        <p className="text-muted text-sm mt-1">
-          FFmpeg will apply zoom-on-click and render to MP4.
-        </p>
-      </header>
+    <div className="flex-1 flex flex-col min-h-0 overflow-hidden" style={{ background: 'var(--bg-1)' }}>
+      <div
+        className="flex-1 overflow-y-auto"
+        style={{ padding: '32px 40px' }}
+      >
+        <div className="max-w-3xl mx-auto w-full">
+          {phase === 'idle' && (
+            <>
+              <div className="flex justify-between items-start" style={{ marginBottom: 28 }}>
+                <div>
+                  <h1 className="text-[22px] font-semibold tracking-tight m-0">Export</h1>
+                  <p className="m-0 mt-1 text-[13px]" style={{ color: 'var(--fg-2)' }}>
+                    FFmpeg will apply zoom-on-click and render to MP4.
+                  </p>
+                </div>
+                <span className="pill pill-acc">
+                  <span className="dot" />Ready
+                </span>
+              </div>
 
-      <section className="bg-panel rounded-lg border border-panel2 p-5 space-y-5">
-        <div>
-          <div className="text-sm mb-2">Quality</div>
-          <div className="grid grid-cols-3 gap-2">
-            {Object.entries(QUALITY_PRESETS).map(([key, p]) => (
-              <button
-                key={key}
-                onClick={() => setQualityKey(key)}
-                disabled={phase === 'running'}
-                className={`py-2 rounded text-sm border ${
-                  qualityKey === key
-                    ? 'border-accent bg-accent/10 text-accent'
-                    : 'border-panel2 text-muted hover:text-white'
-                }`}
-              >
-                {p.label}
-              </button>
-            ))}
-          </div>
-        </div>
+              <section style={{ marginBottom: 24 }}>
+                <div className="label-eyebrow" style={{ display: 'block', marginBottom: 10 }}>Quality</div>
+                <div className="grid grid-cols-3 gap-3">
+                  {QUALITY_PRESETS.map((p) => (
+                    <button
+                      key={p.key}
+                      onClick={() => setQualityKey(p.key)}
+                      className={`preset-card ${qualityKey === p.key ? 'on' : ''}`}
+                    >
+                      <div className="preset-head">
+                        <span className="preset-name">{p.name}</span>
+                        {qualityKey === p.key && (
+                          <span className="preset-check">
+                            <svg width="11" height="11" viewBox="0 0 24 24" fill="none">
+                              <path d="M5 12l5 5L20 7" stroke="currentColor" strokeWidth="3"
+                                    strokeLinecap="round" strokeLinejoin="round" />
+                            </svg>
+                          </span>
+                        )}
+                      </div>
+                      <div className="preset-sub">{p.sub}</div>
+                      <div className="preset-meta">
+                        <span style={{ color: 'var(--fg-1)', fontWeight: 600, fontFamily: 'var(--font-mono)' }}>
+                          {p.size}
+                        </span>
+                        <span style={{ color: 'var(--fg-3)' }}>{p.best}</span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </section>
 
-        <div>
-          <div className="text-sm mb-2">Encoder</div>
-          <div className="grid grid-cols-2 gap-2">
-            <button
-              onClick={() => setEncoder('videotoolbox')}
-              disabled={phase === 'running'}
-              className={`py-2 rounded text-sm border ${
-                encoder === 'videotoolbox'
-                  ? 'border-accent bg-accent/10 text-accent'
-                  : 'border-panel2 text-muted hover:text-white'
-              }`}
-            >
-              VideoToolbox (fast)
-            </button>
-            <button
-              onClick={() => setEncoder('libx264')}
-              disabled={phase === 'running'}
-              className={`py-2 rounded text-sm border ${
-                encoder === 'libx264'
-                  ? 'border-accent bg-accent/10 text-accent'
-                  : 'border-panel2 text-muted hover:text-white'
-              }`}
-            >
-              libx264 (precise)
-            </button>
-          </div>
-        </div>
+              <section style={{ marginBottom: 24 }}>
+                <div className="label-eyebrow" style={{ display: 'block', marginBottom: 10 }}>Encoder</div>
+                <div className="grid grid-cols-2 gap-3">
+                  <button
+                    onClick={() => setEncoder('videotoolbox')}
+                    className={`preset-card ${encoder === 'videotoolbox' ? 'on' : ''}`}
+                  >
+                    <div className="preset-head">
+                      <span className="preset-name">VideoToolbox</span>
+                      {encoder === 'videotoolbox' && (
+                        <span className="preset-check">
+                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none">
+                            <path d="M5 12l5 5L20 7" stroke="currentColor" strokeWidth="3"
+                                  strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </span>
+                      )}
+                    </div>
+                    <div className="preset-sub">Hardware · fast</div>
+                  </button>
+                  <button
+                    onClick={() => setEncoder('libx264')}
+                    className={`preset-card ${encoder === 'libx264' ? 'on' : ''}`}
+                  >
+                    <div className="preset-head">
+                      <span className="preset-name">libx264</span>
+                      {encoder === 'libx264' && (
+                        <span className="preset-check">
+                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none">
+                            <path d="M5 12l5 5L20 7" stroke="currentColor" strokeWidth="3"
+                                  strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </span>
+                      )}
+                    </div>
+                    <div className="preset-sub">Software · precise</div>
+                  </button>
+                </div>
+              </section>
 
-        <div>
-          <div className="text-sm mb-1">Output</div>
-          <div className="text-xs text-muted font-mono break-all">~/Movies/FocuClone/</div>
-        </div>
-      </section>
+              <section style={{ marginBottom: 24 }}>
+                <div className="label-eyebrow" style={{ display: 'block', marginBottom: 10 }}>Output</div>
+                <div
+                  className="flex items-center gap-2.5"
+                  style={{
+                    padding: '10px 12px',
+                    background: 'var(--bg-2)',
+                    border: '1px solid var(--line-2)',
+                    borderRadius: 8,
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: 11.5,
+                    color: 'var(--fg-2)'
+                  }}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" style={{ color: 'var(--fg-3)' }}>
+                    <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"
+                          stroke="currentColor" strokeWidth="1.6" />
+                  </svg>
+                  <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    ~/Movies/FocuClone/
+                  </span>
+                </div>
+              </section>
 
-      <section className="mt-6 bg-panel rounded-lg border border-panel2 p-5">
-        {phase === 'idle' && (
-          <div className="flex items-center justify-between">
-            <div className="text-sm text-muted">Ready to export.</div>
-            <div className="flex gap-2">
-              <button
-                onClick={() => goto('editor')}
-                className="px-4 py-2 rounded-md text-sm border border-panel2 hover:bg-panel2"
-              >
-                Back
-              </button>
-              <button
-                onClick={startExport}
-                className="px-5 py-2 rounded-md bg-accent text-black font-medium text-sm"
-              >
-                Start Export
-              </button>
-            </div>
-          </div>
-        )}
+              <div className="flex gap-3" style={{ paddingTop: 12 }}>
+                <button className="btn btn-ghost" onClick={() => goto('editor')}>
+                  ← Back
+                </button>
+                <button className="btn btn-primary btn-lg" onClick={startExport}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                    <path d="M12 3v12m0 0l-5-5m5 5l5-5M4 21h16" stroke="currentColor" strokeWidth="2"
+                          strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  Start Export
+                </button>
+              </div>
+            </>
+          )}
 
-        {phase === 'running' && (
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-sm">Encoding…</span>
-              <span className="text-sm font-mono">{progress.toFixed(0)}%</span>
-            </div>
-            <div className="h-2 bg-panel2 rounded overflow-hidden">
+          {phase === 'running' && (
+            <div className="flex items-center justify-center" style={{ minHeight: 480 }}>
               <div
-                className="h-full bg-accent transition-all"
-                style={{ width: `${Math.min(100, progress)}%` }}
-              />
-            </div>
-            <p className="text-xs text-muted mt-3">
-              FFmpeg with zoompan is slow — expect ~2× realtime. VideoToolbox helps a lot.
-            </p>
-          </div>
-        )}
-
-        {phase === 'done' && (
-          <div>
-            <div className="text-green-400 mb-3">✓ Export complete</div>
-            <div className="text-xs text-muted font-mono break-all mb-4">
-              {exportResult?.outputPath}
-            </div>
-            <div className="flex gap-2">
-              <button
-                onClick={() => window.electronAPI.openInFinder(exportResult.outputPath)}
-                className="px-4 py-2 rounded-md text-sm border border-panel2 hover:bg-panel2"
-              >
-                Open in Finder
-              </button>
-              <button
-                onClick={() => {
-                  reset()
-                  goto('home')
+                className="flex flex-col items-center gap-3.5 text-center"
+                style={{
+                  width: 540, padding: '36px 32px',
+                  background: 'var(--bg-2)',
+                  border: '1px solid var(--line-2)',
+                  borderRadius: 16
                 }}
-                className="px-5 py-2 rounded-md bg-accent text-black font-medium text-sm"
               >
-                Record again
-              </button>
-            </div>
-          </div>
-        )}
+                <div className="spinner" />
+                <div style={{ font: '600 10px var(--font-ui)', letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--acc)' }}>
+                  Exporting
+                </div>
+                <div style={{ font: '600 20px var(--font-ui)', letterSpacing: '-0.01em' }}>
+                  Rendering your masterpiece
+                </div>
+                <div className="font-mono text-[12px]" style={{ color: 'var(--fg-2)' }}>
+                  {progress.toFixed(0)}% · stage {stageIdx + 1} of {stages.length}
+                </div>
 
-        {phase === 'error' && (
-          <div>
-            <div className="text-red-400 mb-2">Export failed</div>
-            <div className="text-xs text-red-300/80 font-mono whitespace-pre-wrap break-all mb-3">
-              {exportResult?.error}
-            </div>
-            <button
-              onClick={() => setPhase('idle')}
-              className="px-4 py-2 rounded-md text-sm border border-panel2"
-            >
-              Try again
-            </button>
-          </div>
-        )}
-      </section>
+                <div className="progress-track" style={{ marginTop: 4 }}>
+                  <div className="progress-fill" style={{ width: `${Math.min(100, progress)}%` }} />
+                </div>
 
-      {logTail && (phase === 'running' || phase === 'error') && (
-        <details className="mt-4 text-xs">
-          <summary className="text-muted cursor-pointer">FFmpeg output</summary>
-          <pre className="mt-2 p-3 bg-black rounded text-muted/70 max-h-40 overflow-auto whitespace-pre-wrap">
-            {logTail}
-          </pre>
-        </details>
-      )}
+                <div className="flex gap-2 mt-2">
+                  {stages.map((s, i) => (
+                    <span
+                      key={s}
+                      className="flex items-center gap-1.5"
+                      style={{
+                        padding: '5px 10px',
+                        borderRadius: 999,
+                        background:
+                          i < stageIdx ? 'rgba(52,211,153,0.12)'
+                          : i === stageIdx ? 'var(--acc-soft)'
+                          : 'var(--bg-3)',
+                        border: `1px solid ${
+                          i < stageIdx ? 'rgba(52,211,153,0.3)'
+                          : i === stageIdx ? 'var(--acc)'
+                          : 'var(--line-2)'
+                        }`,
+                        color:
+                          i < stageIdx ? 'var(--ok)'
+                          : i === stageIdx ? 'var(--acc-hi)'
+                          : 'var(--fg-3)',
+                        font: '500 11px var(--font-ui)'
+                      }}
+                    >
+                      {i < stageIdx ? '✓' : i + 1} {s}
+                    </span>
+                  ))}
+                </div>
+
+                <button
+                  className="btn btn-quiet btn-sm mt-1"
+                  onClick={() => setShowLogs((v) => !v)}
+                >
+                  {showLogs ? 'Hide logs' : 'Show logs'}
+                </button>
+                {showLogs && logTail && (
+                  <pre
+                    className="w-full font-mono text-[11px] text-left"
+                    style={{
+                      maxHeight: 160, overflowY: 'auto',
+                      background: '#060709',
+                      border: '1px solid var(--line-2)',
+                      borderRadius: 8,
+                      padding: '12px 14px',
+                      color: 'var(--fg-2)',
+                      whiteSpace: 'pre',
+                      lineHeight: 1.6
+                    }}
+                  >{logTail}</pre>
+                )}
+              </div>
+            </div>
+          )}
+
+          {phase === 'done' && (
+            <div className="flex items-center justify-center" style={{ minHeight: 480 }}>
+              <div
+                className="flex flex-col items-center gap-3.5 text-center"
+                style={{
+                  width: 540, padding: '36px 32px',
+                  background: 'var(--bg-2)',
+                  border: '1px solid var(--line-2)',
+                  borderRadius: 16
+                }}
+              >
+                <span className="success-burst">
+                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
+                    <path d="M5 12l5 5L20 7" stroke="currentColor" strokeWidth="2.5"
+                          strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </span>
+                <div style={{ font: '600 10px var(--font-ui)', letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--ok)' }}>
+                  Export complete
+                </div>
+                <div style={{ font: '600 20px var(--font-ui)', letterSpacing: '-0.01em' }}>
+                  Saved to your Movies folder
+                </div>
+                <div className="font-mono text-[12px] break-all" style={{ color: 'var(--fg-2)' }}>
+                  {exportResult?.outputPath}
+                </div>
+                <div className="flex gap-2.5 mt-2">
+                  <button
+                    className="btn btn-ghost"
+                    onClick={() => window.electronAPI.openInFinder(exportResult.outputPath)}
+                  >
+                    Open in Finder
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    onClick={() => { reset(); goto('home') }}
+                  >
+                    Record again
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {phase === 'error' && (
+            <div className="flex items-center justify-center" style={{ minHeight: 480 }}>
+              <div
+                className="flex flex-col items-center gap-3.5 text-center"
+                style={{
+                  width: 540, padding: '36px 32px',
+                  background: 'var(--bg-2)',
+                  border: '1px solid var(--line-2)',
+                  borderRadius: 16
+                }}
+              >
+                <span className="error-burst">
+                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
+                    <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeWidth="2.5"
+                          strokeLinecap="round" />
+                  </svg>
+                </span>
+                <div style={{ font: '600 10px var(--font-ui)', letterSpacing: '0.1em', textTransform: 'uppercase', color: '#FF8484' }}>
+                  Export failed
+                </div>
+                <div style={{ font: '600 20px var(--font-ui)', letterSpacing: '-0.01em' }}>
+                  Something went wrong
+                </div>
+                <pre
+                  className="w-full font-mono text-[11px] text-left whitespace-pre-wrap break-all"
+                  style={{
+                    maxHeight: 160, overflowY: 'auto',
+                    background: '#060709',
+                    border: '1px solid var(--line-2)',
+                    borderRadius: 8,
+                    padding: '12px 14px',
+                    color: '#FFB4B4',
+                    lineHeight: 1.6
+                  }}
+                >
+                  {exportResult?.error}
+                </pre>
+                <div className="flex gap-2.5 mt-2">
+                  <button className="btn btn-ghost" onClick={() => goto('editor')}>← Back to Edit</button>
+                  <button className="btn btn-primary" onClick={() => setPhase('idle')}>Try again</button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   )
 }

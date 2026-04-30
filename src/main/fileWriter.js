@@ -28,7 +28,13 @@ export async function startNewSession({ withCamera = false } = {}) {
 }
 
 export function appendChunk(buffer) {
-  if (!activeSession) throw new Error('No active session')
+  // MediaRecorder typically delivers a final ondataavailable event AFTER
+  // stop() has already triggered finalizeSession on our side. Treat late
+  // writes as a no-op instead of throwing — the pre-stop chunks are already
+  // safely on disk.
+  if (!activeSession || !activeSession.writer || activeSession.writer.writableEnded) {
+    return Promise.resolve(0)
+  }
   return new Promise((resolve, reject) => {
     activeSession.bytes += buffer.byteLength
     activeSession.writer.write(Buffer.from(buffer), (err) => {
@@ -39,8 +45,11 @@ export function appendChunk(buffer) {
 }
 
 export function appendWebcamChunk(buffer) {
-  if (!activeSession || !activeSession.webcamWriter) {
-    // Nothing to do — webcam wasn't enabled at session start.
+  if (
+    !activeSession ||
+    !activeSession.webcamWriter ||
+    activeSession.webcamWriter.writableEnded
+  ) {
     return Promise.resolve(0)
   }
   return new Promise((resolve, reject) => {

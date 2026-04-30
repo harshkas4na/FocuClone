@@ -1,4 +1,6 @@
-import { ipcMain, desktopCapturer, screen, shell, dialog } from 'electron'
+import { ipcMain, desktopCapturer, screen, shell, dialog, app } from 'electron'
+import { promises as fs } from 'fs'
+import { join } from 'path'
 import {
   startNewSession,
   appendChunk,
@@ -101,6 +103,17 @@ export function registerIpcHandlers(getWindow) {
       send('export-log', `ERROR: ${err.message}`)
       return { ok: false, error: err.message }
     }
+  })
+
+  // Renderer rasterizes a few PNGs (cursor skin, rounded-corner mask) for the
+  // current export and asks main to drop them in a temp folder. We hand back
+  // the absolute path so the processor can reference them in the filtergraph.
+  ipcMain.handle('save-temp-asset', async (_e, { name, buffer }) => {
+    const dir = join(app.getPath('temp'), 'focuclone-export')
+    await fs.mkdir(dir, { recursive: true })
+    const path = join(dir, name)
+    await fs.writeFile(path, Buffer.from(buffer))
+    return { path }
   })
 
   ipcMain.handle('open-in-finder', async (_e, filePath) => {

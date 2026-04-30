@@ -749,6 +749,18 @@ function FramedCanvas({
     return () => ro.disconnect()
   }, [aspect])
 
+  // Convert the roundness % into a uniform pixel radius based on the inset
+  // box's short side. This mirrors the export pipeline exactly so what you
+  // see is what gets rendered into the MP4.
+  const insetSize = (() => {
+    const padFrac = padPct / 100
+    const insetFrac = insetPct / 100
+    const w = Math.max(0, box.w * (1 - 2 * padFrac) * (1 - 2 * insetFrac))
+    const h = Math.max(0, box.h * (1 - 2 * padFrac) * (1 - 2 * insetFrac))
+    return Math.min(w, h)
+  })()
+  const roundnessPxComputed = (roundnessPx / 100) * insetSize
+
   return (
     <div
       ref={parentRef}
@@ -760,7 +772,10 @@ function FramedCanvas({
       style={{
         width: box.w || '100%',
         height: box.h || '100%',
-        background: bgCss,
+        // Avoid mixing shorthand `background` with longhand siblings — React
+        // warns and the longhands can get blown away on rerender.
+        backgroundImage: bgCss.includes('gradient') ? bgCss : 'none',
+        backgroundColor: bgCss.includes('gradient') ? 'transparent' : bgCss,
         backgroundSize: 'cover',
         backgroundPosition: 'center'
       }}
@@ -778,7 +793,10 @@ function FramedCanvas({
             height: '100%',
             background: insetPct > 0 ? insetColor : 'transparent',
             padding: `${insetPct}%`,
-            borderRadius: roundnessPx,
+            // Roundness is a % of the inset short side. Computing it in px from
+            // the measured box keeps a true-uniform corner (CSS `border-radius:
+            // X%` would yield an ellipse on non-square boxes).
+            borderRadius: roundnessPxComputed,
             boxShadow: shadowCss
           }}
         >
@@ -789,7 +807,7 @@ function FramedCanvas({
             style={{
               width: '100%',
               height: '100%',
-              borderRadius: Math.max(0, roundnessPx - 2)
+              borderRadius: Math.max(0, roundnessPxComputed - 1)
             }}
           >
             {children}
@@ -1188,8 +1206,8 @@ function BackgroundPanel({ settings, update }) {
           onChange={(inset) => update({ inset })} />
         <ColorPicker label="Inset color" value={settings.insetColor}
           onChange={(insetColor) => update({ insetColor })} />
-        <Slider label="Roundness" value={settings.roundness} min={0} max={60} step={1}
-          format={(v) => `${v}px`}
+        <Slider label="Roundness" value={settings.roundness} min={0} max={30} step={0.5}
+          format={(v) => `${v.toFixed(1)}%`}
           onChange={(roundness) => update({ roundness })} />
         <Slider label="Shadow" value={settings.shadow} min={0} max={200} step={2}
           format={(v) => `${v}`}

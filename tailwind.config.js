@@ -4,11 +4,31 @@ export default {
   theme: {
     extend: {
       colors: {
-        bg: '#0e0e10',
-        panel: '#17171a',
-        panel2: '#1f1f23',
-        accent: '#f97316',
-        muted: '#5d5d66'
+        // Studio Dark palette
+        bg: '#0E1014',
+        'bg-0': '#08090C',
+        'bg-1': '#0E1014',
+        'bg-2': '#15171C',
+        'bg-3': '#1C1F26',
+        'bg-4': '#242832',
+        panel: '#15171C',
+        panel2: '#1C1F26',
+        accent: '#FF5C2B',
+        'accent-hi': '#FF7A4D',
+        'accent-lo': '#C73F18',
+        muted: '#6E7079',
+        'fg-1': '#F5F5F7',
+        'fg-2': '#A8AAB2',
+        'fg-3': '#6E7079',
+        'fg-4': '#4A4D55',
+        rec: '#FF3B3B',
+        ok: '#34D399',
+        warn: '#F5B544',
+        err: '#FF6B6B'
+      },
+      fontFamily: {
+        ui: ['Inter', '-apple-system', 'system-ui', 'sans-serif'],
+        mono: ['JetBrains Mono', 'ui-monospace', 'Menlo', 'monospace']
       }
     }
   },

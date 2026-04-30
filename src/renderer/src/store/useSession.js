@@ -51,7 +51,7 @@ export const useSession = create((set, get) => ({
     padding: 5, // 0–20 (% of shorter canvas side)
     inset: 0, // 0–10 (% of shorter side, inner border)
     insetColor: '#000000',
-    roundness: 16, // 0–60 (px on the inset rectangle)
+    roundness: 4, // 0–30 (% of inset short side; matches preview AND export)
     shadow: 80, // 0–200 (shadow blur radius factor)
     backgroundKind: 'wallpaper', // solid | gradient | wallpaper
     backgroundValue: 'wallpaper-1',

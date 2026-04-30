@@ -11,6 +11,8 @@ const api = {
   writeChunk: (buffer) => ipcRenderer.invoke('write-chunk', buffer),
   writeWebcamChunk: (buffer) => ipcRenderer.invoke('write-webcam-chunk', buffer),
 
+  saveTempAsset: (name, buffer) =>
+    ipcRenderer.invoke('save-temp-asset', { name, buffer }),
   processVideo: (session, opts) => ipcRenderer.invoke('process-video', { session, opts }),
   openInFinder: (filePath) => ipcRenderer.invoke('open-in-finder', filePath),
   showSaveDialog: (defaultPath) => ipcRenderer.invoke('show-save-dialog', defaultPath),
