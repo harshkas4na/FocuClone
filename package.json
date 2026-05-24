@@ -6,11 +6,13 @@
   "author": "harsh",
   "private": true,
   "scripts": {
-    "dev": "electron-vite dev",
-    "build": "electron-vite build",
+    "dev": "node scripts/build-native-helper.mjs && electron-vite dev",
+    "build": "node scripts/build-native-helper.mjs && electron-vite build",
+    "build:native": "node scripts/build-native-helper.mjs",
+    "build:native:all": "node scripts/build-native-helper.mjs --all",
     "start": "electron-vite preview",
-    "pack": "electron-vite build && electron-builder --dir",
-    "dist": "electron-vite build && electron-builder"
+    "pack": "node scripts/build-native-helper.mjs && electron-vite build && electron-builder --dir",
+    "dist": "node scripts/build-native-helper.mjs --all && electron-vite build && electron-builder"
   },
   "dependencies": {
     "electron-store": "^8.2.0",

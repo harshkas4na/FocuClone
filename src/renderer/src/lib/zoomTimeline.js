@@ -8,12 +8,26 @@
 // A Zoom owns its own timing/center/level, so per-zoom edits don't bleed
 // into other zooms.
 
+// Timing + magnification defaults.
+//
+// The model is "continuous zoom with click retargeting" — exactly how
+// FocuSee / Screen Studio feel. A cluster is any run of clicks within
+// `clusterMergeGapMs` of each other (no distance gate; far-apart clicks
+// inside a session still belong to one continuous zoom — the camera just
+// pans between them via the dead-zone follow and anchor list). The whole
+// cluster becomes ONE zoom region whose zoom level stays at peak while the
+// user is active, and whose cx/cy retargets to each successive click via
+// per-anchor points.
+//
+// Tight ease durations + a long-ish merge gap = one slow zoom-in once, fluid
+// pans around as the user clicks, one slow zoom-out when they stop.
 export const DEFAULT_TIMELINE_OPTS = {
-  zoomLevel: 2.0,
-  easeInDuration: 280,
-  holdDuration: 1200,
-  easeOutDuration: 360,
-  minTimeBetweenZooms: 800
+  zoomLevel: 1.5,
+  easeInDuration: 150,
+  holdDuration: 700,         // hold time AFTER the last click in a cluster
+  easeOutDuration: 200,
+  clusterMergeGapMs: 2500,   // up to 2.5s gap between clicks still merges
+  clusterPadMs: 60           // tiny lead-in before the first click
 }
 
 let _idSeq = 0
@@ -23,25 +37,104 @@ function makeId() {
 }
 
 // ─── Build Zooms from click events ─────────────────────────────────────────
+//
+// Clusters consecutive clicks that fall within `clusterMergeGapMs` of each
+// other into ONE zoom region. The region:
+//   • starts at firstClick - clusterPadMs (clamped ≥ 0)
+//   • holds through lastClick + holdDuration
+//   • eases out over easeOutDuration
+//   • focuses on the centroid of the cluster's clicks
+// Single-click clusters reduce to the original per-click zoom shape when
+// clusterPadMs = 0.
+function normClick(c) {
+  return {
+    nx: c.screenW > 0 ? c.x / c.screenW : 0.5,
+    ny: c.screenH > 0 ? c.y / c.screenH : 0.5
+  }
+}
+
 export function zoomsFromEvents(events, opts = {}) {
   const o = { ...DEFAULT_TIMELINE_OPTS, ...opts }
-  const clicks = (events || []).filter((e) => e.type === 'click')
-  const debounced = []
-  for (const c of clicks) {
-    const last = debounced[debounced.length - 1]
-    if (!last || c.timestamp - last.timestamp >= o.minTimeBetweenZooms) debounced.push(c)
+  const clicks = (events || [])
+    .filter((e) => e.type === 'click')
+    .slice()
+    .sort((a, b) => a.timestamp - b.timestamp)
+  if (!clicks.length) return []
+
+  // Time-only clustering. We deliberately don't gate on click distance:
+  // distant clicks within a session are MEANT to share one zoom — the
+  // camera just pans between them via anchor retargeting during peak hold.
+  // Splitting on distance was what produced the "zoom out, zoom in, zoom
+  // out, zoom in" chaos when the user clicked around quickly.
+  const clusters = []
+  let cur = [clicks[0]]
+  for (let i = 1; i < clicks.length; i++) {
+    const c = clicks[i]
+    const prev = cur[cur.length - 1]
+    if (c.timestamp - prev.timestamp <= o.clusterMergeGapMs) {
+      cur.push(c)
+    } else {
+      clusters.push(cur)
+      cur = [c]
+    }
   }
-  return debounced.map((c) => ({
-    id: makeId(),
-    source: 'click',
-    cx: c.screenW > 0 ? c.x / c.screenW : 0.5,
-    cy: c.screenH > 0 ? c.y / c.screenH : 0.5,
-    start: c.timestamp,
-    peakStart: c.timestamp + o.easeInDuration,
-    peakEnd: c.timestamp + o.easeInDuration + o.holdDuration,
-    end: c.timestamp + o.easeInDuration + o.holdDuration + o.easeOutDuration,
-    zoomLevel: o.zoomLevel
-  }))
+  clusters.push(cur)
+
+  return clusters.map((cluster) => {
+    const first = cluster[0]
+    const last = cluster[cluster.length - 1]
+    // Per-anchor retarget timeline: each click contributes a (t, cx, cy)
+    // point. sampleZoomFromZooms picks the most recent anchor for the
+    // camera center during peak hold; springs smooth the transitions.
+    // Single-click clusters omit the anchor array since there's nothing to
+    // retarget to.
+    const anchors = cluster.map((c) => {
+      const n = normClick(c)
+      return { t: c.timestamp, cx: n.nx, cy: n.ny }
+    })
+    const lastN = normClick(last)
+    const start = Math.max(0, first.timestamp - o.clusterPadMs)
+    const peakStart = start + o.easeInDuration
+    // Hold ends `holdDuration` AFTER the last click — so each new click in
+    // the cluster pushes the hold window forward instead of cutting it short.
+    const peakEnd = Math.max(peakStart + 50, last.timestamp + o.holdDuration)
+    const end = peakEnd + o.easeOutDuration
+    return {
+      id: makeId(),
+      source: 'click',
+      // Primary anchor = last click (fallback when anchors absent / for the
+      // simple FFmpeg expression path).
+      cx: lastN.nx,
+      cy: lastN.ny,
+      anchors: cluster.length > 1 ? anchors : undefined,
+      start,
+      peakStart,
+      peakEnd,
+      end,
+      zoomLevel: o.zoomLevel,
+      clusterSize: cluster.length
+    }
+  })
+}
+
+// Resolve the camera (cx, cy) target for a zoom region at the given time.
+// If the zoom has anchor points (multi-click cluster), pick the most recent
+// anchor whose t ≤ tMs. Otherwise fall back to the static cx/cy.
+export function anchorAt(zoom, tMs) {
+  if (!zoom.anchors || zoom.anchors.length === 0) {
+    return { cx: zoom.cx, cy: zoom.cy }
+  }
+  // anchors are inserted in time order by zoomsFromEvents; binary-search.
+  let lo = 0
+  let hi = zoom.anchors.length - 1
+  if (tMs <= zoom.anchors[0].t) return { cx: zoom.anchors[0].cx, cy: zoom.anchors[0].cy }
+  if (tMs >= zoom.anchors[hi].t) return { cx: zoom.anchors[hi].cx, cy: zoom.anchors[hi].cy }
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1
+    if (zoom.anchors[mid].t <= tMs) lo = mid
+    else hi = mid
+  }
+  return { cx: zoom.anchors[lo].cx, cy: zoom.anchors[lo].cy }
 }
 
 export function makeManualZoom(centerMs, opts = {}) {
@@ -98,10 +191,18 @@ function easeInCubic(p) {
 }
 
 // Sample (zoom, cx, cy) at time t (ms) from a zooms array.
+//
+// When multiple zooms overlap, the zoom LEVEL is `max` across them (you'd
+// rather be too-zoomed than too-loose), and the cx/cy is a WEIGHTED BLEND
+// by ease — without that blend, the camera center snaps from one anchor to
+// another on the single frame where the dominant z changes hands, which
+// shows up as a visible flicker. The blend means the camera glides between
+// anchors smoothly during the overlap.
 export function sampleZoomFromZooms(zooms, tMs) {
   let bestZ = 1
-  let bestCx = 0.5
-  let bestCy = 0.5
+  let cxAccum = 0
+  let cyAccum = 0
+  let weightAccum = 0
   for (const w of zooms || []) {
     if (tMs < w.start || tMs > w.end) continue
     let ease
@@ -115,13 +216,19 @@ export function sampleZoomFromZooms(zooms, tMs) {
       ease = 1
     }
     const z = 1 + (w.zoomLevel - 1) * ease
-    if (z > bestZ) {
-      bestZ = z
-      bestCx = w.cx
-      bestCy = w.cy
-    }
+    if (z > bestZ) bestZ = z
+    // Pull the current camera anchor from the zoom's per-click anchor list
+    // (or its static cx/cy if it doesn't have anchors). Multi-click clusters
+    // smoothly retarget here while the zoom stays at peak — that's what
+    // gives the "camera follows me click-to-click" feel instead of
+    // zoom-out-zoom-in chaos.
+    const a = anchorAt(w, tMs)
+    cxAccum += a.cx * ease
+    cyAccum += a.cy * ease
+    weightAccum += ease
   }
-  return { zoom: bestZ, cx: bestCx, cy: bestCy }
+  if (weightAccum <= 0) return { zoom: 1, cx: 0.5, cy: 0.5 }
+  return { zoom: bestZ, cx: cxAccum / weightAccum, cy: cyAccum / weightAccum }
 }
 
 // Find the zoom currently active at time tMs (if any). When multiple overlap,

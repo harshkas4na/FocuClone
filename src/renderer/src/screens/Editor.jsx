@@ -11,8 +11,28 @@ import {
   decimateMoves,
   sampleMouseAt
 } from '../lib/zoomTimeline.js'
+import { sampleCameraTarget } from '../lib/cameraTrack.js'
+import {
+  createSpring,
+  resetSpring,
+  stepSpring,
+  ZOOM_SPRING,
+  CENTER_SPRING,
+  CURSOR_SPRING
+} from '../lib/motionSmoothing.js'
 import { BACKGROUNDS, BACKGROUND_CATEGORIES, findBackground, CANVAS_ASPECTS, aspectRatioOf } from '../lib/backgrounds.js'
 import { CURSOR_STYLES, CURSOR_FAMILIES, findCursorStyle, CLICK_EFFECTS } from '../lib/cursors.js'
+import {
+  defaultGeometryFor,
+  defaultColorFor,
+  defaultDurationMsFor,
+  DEFAULT_FADE_MS,
+  DEFAULT_BLUR_RADIUS,
+  DEFAULT_SPOTLIGHT_DARKNESS,
+  DEFAULT_MAGNIFIER_ZOOM,
+  TEXT_STYLE_DEFS as TEXT_DEFS_DATA,
+  SHAPE_DEFS as SHAPE_DEFS_DATA
+} from '../lib/annotations.js'
 
 const PANELS = [
   { id: 'background', label: 'Background', icon: 'bg' },
@@ -30,7 +50,8 @@ const ANNOTATION_TEXT_STYLES = [
   { id: 'bubble', label: 'Bubble', preview: 'Text', cls: 'bg-violet-500 text-white px-3 py-1 rounded-md shadow-lg' },
   { id: 'glass', label: 'Glass', preview: 'Text', cls: 'bg-white/15 backdrop-blur-md text-white px-3 py-1 rounded-md border border-white/20' },
   { id: 'outline', label: 'Outline', preview: 'Text', cls: 'border-2 border-pink-500 text-white px-3 py-1 rounded-md' },
-  { id: 'badge', label: 'Badge', preview: '1', cls: 'bg-lime-300 text-black w-8 h-8 rounded-full flex items-center justify-center font-bold' }
+  { id: 'badge', label: 'Badge', preview: '1', cls: 'bg-lime-300 text-black w-8 h-8 rounded-full flex items-center justify-center font-bold' },
+  { id: 'counter', label: 'Counter', preview: '1', cls: 'bg-yellow-300 text-black w-8 h-8 rounded-full flex items-center justify-center font-bold' }
 ]
 
 const ANNOTATION_SHAPES = [
@@ -51,6 +72,7 @@ const ANNOTATION_MASKS = [
 export default function Editor() {
   const session = useSession((s) => s.session)
   const goto = useSession((s) => s.goto)
+  const reset = useSession((s) => s.reset)
   const exportSettings = useSession((s) => s.exportSettings)
   const updateExportSettings = useSession((s) => s.updateExportSettings)
   const zooms = useSession((s) => s.zooms)
@@ -82,6 +104,35 @@ export default function Editor() {
   const rafRef = useRef(0)
   const currentMsRef = useRef(0)
   const lastClickIdxRef = useRef(-1)
+  // Idle-frame counter — once the springs have settled and the video is
+  // paused, we stop scheduling rAF until the user plays / scrubs / changes
+  // anything. Prevents constant 60Hz spinning while the editor is idle.
+  const idleFramesRef = useRef(0)
+  // Stable refs so the rAF tick can pull the latest props without forcing the
+  // effect that owns rAF to re-bind on every render. Re-binding was throwing
+  // away spring velocity and chewing CPU during settings tweaks.
+  const propsRef = useRef({
+    session: null,
+    zooms: [],
+    decimated: [],
+    clicks: [],
+    exportSettings: null,
+    previewEnabled: true
+  })
+
+  // Spring state for the live preview camera. Persisted across rAF ticks.
+  // Reset on big time jumps (scrubs) so the camera snaps instead of dragging.
+  const zoomSpringRef = useRef(createSpring(1))
+  const cxSpringRef = useRef(createSpring(0.5))
+  const cySpringRef = useRef(createSpring(0.5))
+  // Cursor position spring — smooths the displayed pointer in viewport space
+  // so it doesn't pixel-stair through the linear-interpolated sample grid.
+  // Separate from the camera springs because the cursor and the camera
+  // settle at different rates.
+  const curXSpringRef = useRef(createSpring(0.5))
+  const curYSpringRef = useRef(createSpring(0.5))
+  const lastTickTimeRef = useRef(0)
+  const lastTickMsRef = useRef(0)
 
   const [currentMs, setCurrentMs] = useState(0)
   const [durationMs, setDurationMs] = useState(session?.duration || 0)
@@ -91,16 +142,21 @@ export default function Editor() {
   const [pendingAnnotation, setPendingAnnotation] = useState(null) // { kind, ...spec }
   const [clickPulses, setClickPulses] = useState([]) // {id, xPct, yPct, kind, born}
 
+  // Re-derive zooms whenever the session itself changes (id flips on every
+  // new recording). Without keying on id, leftover zooms from a previous
+  // session would persist for the next one, since `zooms.length` is non-zero
+  // and the old logic short-circuited. That manifested as "I recorded again
+  // and the auto-zooms from my last clip are still showing."
   useEffect(() => {
     if (!session) {
       goto('home')
       return
     }
-    if (!zooms.length) {
-      const initial = zoomsFromEvents(session.events || [], exportSettings)
-      setZooms(initial)
-    }
-  }, [session])
+    const initial = zoomsFromEvents(session.events || [], exportSettings)
+    setZooms(initial)
+    // We deliberately depend on session.id, not the whole session object —
+    // re-running on every settings tweak would clobber user edits.
+  }, [session?.id])
 
   const selectedZoom = useMemo(
     () => zooms.find((z) => z.id === selectedZoomId) || null,
@@ -109,7 +165,11 @@ export default function Editor() {
 
   const decimated = useMemo(() => {
     if (!session) return []
-    return decimateMoves(session.events || [], { cursorMoveSampleHz: 30, cursorMoveMinDeltaPx: 4 })
+    // Sample at 60 Hz with a 2 px threshold so slow drags don't get dropped.
+    // The cursor spring downstream takes care of denoising any residual jitter;
+    // a denser source path is much better than an over-decimated one with
+    // visible polygonal corners.
+    return decimateMoves(session.events || [], { cursorMoveSampleHz: 60, cursorMoveMinDeltaPx: 2 })
   }, [session])
 
   const events = session?.events || []
@@ -120,69 +180,170 @@ export default function Editor() {
   const canvasAspect = aspectRatioOf(exportSettings.canvasAspect, sourceAspect)
   const bg = findBackground(exportSettings.backgroundValue)
 
+  // Keep the latest props in a ref so the rAF loop can read them without
+  // re-binding on every change. Re-binding was costing 5-10ms per settings
+  // tweak and destroying spring velocity state.
+  propsRef.current = { session, zooms, decimated, clicks, exportSettings, previewEnabled }
+
   // rAF loop: zoom transform, cursor positioning, idle hide, and click-effect spawning.
-  useEffect(() => {
+  //
+  // Camera = target curve (zoomTimeline) → spring smoother → CSS transform.
+  // The cursor's viewport position runs through its own small spring so it
+  // doesn't pixel-stair through the 30Hz cursor sample grid.
+  //
+  // When the video is paused AND the springs have settled, the loop stops
+  // scheduling frames until something changes — saves ~5% CPU when idle.
+  // Play / scrub / spring-disrupting events tick `idleFramesRef.current` back
+  // up so the loop resumes for the settle window, then re-idles.
+  function ensureLoop() {
+    if (rafRef.current) return
     function tick() {
+      rafRef.current = 0
+      const {
+        session: s,
+        zooms: zs,
+        decimated: dec,
+        clicks: cls,
+        exportSettings: es,
+        previewEnabled: pe
+      } = propsRef.current
       const v = videoRef.current
       const wrap = innerRef.current
-      const cur = cursorOverlayRef.current
-      if (v && wrap && session) {
-        const tMs = v.currentTime * 1000
-        if (previewEnabled) {
-          const { zoom, cx, cy } = sampleZoomFromZooms(zooms, tMs)
-          v.style.transformOrigin = `${(cx * 100).toFixed(2)}% ${(cy * 100).toFixed(2)}%`
-          v.style.transform = `scale(${zoom.toFixed(3)})`
+      const curEl = cursorOverlayRef.current
+      if (!v || !wrap || !s) {
+        // Nothing to do; idle.
+        return
+      }
+      const tMs = v.currentTime * 1000
+      const now = performance.now()
+      const dt = lastTickTimeRef.current ? now - lastTickTimeRef.current : 16.67
+      lastTickTimeRef.current = now
 
-          if (cur) {
-            const inZoom = activeZoomAt(zooms, tMs) != null
-            const showByZoom = exportSettings.hideCursorWhenIdle ? inZoom : true
-            if (showByZoom && exportSettings.showCursor) {
-              const useFollow = exportSettings.cursorFollowsMouse
-              const { x: mx, y: my } = useFollow
-                ? sampleMouseAt(decimated, tMs, { x: cx, y: cy })
-                : { x: cx, y: cy }
-              const oxNorm = inZoom ? (mx - cx) * zoom + 0.5 : mx
-              const oyNorm = inZoom ? (my - cy) * zoom + 0.5 : my
-              cur.style.left = `${oxNorm * 100}%`
-              cur.style.top = `${oyNorm * 100}%`
-              cur.style.opacity = '1'
-            } else {
-              cur.style.opacity = '0'
-            }
-          }
-        } else {
-          v.style.transform = 'none'
-          if (cur) cur.style.opacity = '0'
+      // Detect scrubs / pause-resume gaps and snap springs to target instead
+      // of letting them drag through the whole jump.
+      const tJump = Math.abs(tMs - lastTickMsRef.current) > 250
+      lastTickMsRef.current = tMs
+      const playing = !v.paused
+
+      if (pe) {
+        const target = sampleCameraTarget(zs, dec, tMs, {
+          cursorFollowMode: es.cursorFollowMode,
+          cursorFollowSafeZone: es.cursorFollowSafeZone,
+          cursorFollowAmount: es.cursorFollowAmount
+        })
+        if (tJump) {
+          resetSpring(zoomSpringRef.current, target.zoom)
+          resetSpring(cxSpringRef.current, target.cx)
+          resetSpring(cySpringRef.current, target.cy)
         }
+        const zoom = stepSpring(zoomSpringRef.current, target.zoom, dt, ZOOM_SPRING)
+        const cx = stepSpring(cxSpringRef.current, target.cx, dt, CENTER_SPRING)
+        const cy = stepSpring(cySpringRef.current, target.cy, dt, CENTER_SPRING)
 
-        // Spawn click-effect pulses when the playhead crosses click events.
-        if (exportSettings.clickEffect !== 'none' && clicks.length) {
-          const lastIdx = lastClickIdxRef.current
-          for (let i = 0; i < clicks.length; i++) {
-            const cMs = clicks[i].timestamp
-            if (cMs <= tMs && cMs > tMs - 80 && i !== lastIdx) {
-              lastClickIdxRef.current = i
-              const xNorm = clicks[i].x / (session.screenW || 1)
-              const yNorm = clicks[i].y / (session.screenH || 1)
-              spawnClickPulse(xNorm, yNorm, exportSettings.clickEffect, tMs)
-              break
+        v.style.transformOrigin = `${(cx * 100).toFixed(2)}% ${(cy * 100).toFixed(2)}%`
+        v.style.transform = `scale(${zoom.toFixed(3)})`
+
+        if (curEl) {
+          const inZoom = activeZoomAt(zs, tMs) != null
+          const showByZoom = es.hideCursorWhenIdle ? inZoom : true
+          if (showByZoom && es.showCursor) {
+            const useFollow = es.cursorFollowsMouse
+            const { x: mx, y: my } = useFollow
+              ? sampleMouseAt(dec, tMs, { x: cx, y: cy })
+              : { x: cx, y: cy }
+            // Viewport-space target: where the cursor sits inside the
+            // zoomed frame [0..1]. Outside a zoom, this is just (mx, my).
+            const oxTarget = inZoom ? (mx - cx) * zoom + 0.5 : mx
+            const oyTarget = inZoom ? (my - cy) * zoom + 0.5 : my
+            if (tJump) {
+              resetSpring(curXSpringRef.current, oxTarget)
+              resetSpring(curYSpringRef.current, oyTarget)
             }
-          }
-          if (lastIdx >= 0 && clicks[lastIdx] && clicks[lastIdx].timestamp > tMs + 200) {
-            lastClickIdxRef.current = -1
+            // A lighter spring for the cursor (fast snap, no wobble) — the
+            // camera already smooths big motions, this just denoises the
+            // 30Hz sample stairs.
+            const ox = stepSpring(curXSpringRef.current, oxTarget, dt, CURSOR_SPRING)
+            const oy = stepSpring(curYSpringRef.current, oyTarget, dt, CURSOR_SPRING)
+            curEl.style.left = `${ox * 100}%`
+            curEl.style.top = `${oy * 100}%`
+            curEl.style.opacity = '1'
+          } else {
+            curEl.style.opacity = '0'
           }
         }
+      } else {
+        v.style.transform = 'none'
+        if (curEl) curEl.style.opacity = '0'
+        resetSpring(zoomSpringRef.current, 1)
+        resetSpring(cxSpringRef.current, 0.5)
+        resetSpring(cySpringRef.current, 0.5)
+      }
 
-        if (Math.abs(tMs - currentMsRef.current) > 30) {
-          setCurrentMs(tMs)
-          currentMsRef.current = tMs
+      // Spawn click-effect pulses when the playhead crosses click events.
+      if (es.clickEffect !== 'none' && cls.length) {
+        const lastIdx = lastClickIdxRef.current
+        for (let i = 0; i < cls.length; i++) {
+          const cMs = cls[i].timestamp
+          if (cMs <= tMs && cMs > tMs - 80 && i !== lastIdx) {
+            lastClickIdxRef.current = i
+            const xNorm = cls[i].x / (s.screenW || 1)
+            const yNorm = cls[i].y / (s.screenH || 1)
+            spawnClickPulse(xNorm, yNorm, es.clickEffect, tMs)
+            break
+          }
+        }
+        if (lastIdx >= 0 && cls[lastIdx] && cls[lastIdx].timestamp > tMs + 200) {
+          lastClickIdxRef.current = -1
         }
       }
-      rafRef.current = requestAnimationFrame(tick)
+
+      if (Math.abs(tMs - currentMsRef.current) > 30) {
+        setCurrentMs(tMs)
+        currentMsRef.current = tMs
+      }
+
+      // Decide whether to schedule another frame. Always loop while playing.
+      // While paused, keep ticking for a short settle window so springs have
+      // a chance to converge on the new target — then go idle. `wakeLoop()`
+      // resets idleFrames so any external change (scrub, edit, settings)
+      // brings us back to life.
+      if (playing) {
+        idleFramesRef.current = 0
+        rafRef.current = requestAnimationFrame(tick)
+        return
+      }
+      idleFramesRef.current += 1
+      // ~0.6s @ 60Hz settle budget; springs at our stiffness/damping converge
+      // well inside that.
+      if (idleFramesRef.current < 36) {
+        rafRef.current = requestAnimationFrame(tick)
+      }
     }
     rafRef.current = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(rafRef.current)
-  }, [session, exportSettings, previewEnabled, zooms, decimated, clicks])
+  }
+
+  // Kick the rAF loop awake from external events (effect re-runs, click,
+  // user input). Called via wakeLoopRef so we don't add it to every dep array.
+  function wakeLoop() {
+    idleFramesRef.current = 0
+    ensureLoop()
+  }
+  // Stable ref alias for callbacks below.
+  const wakeLoopRef = useRef(wakeLoop)
+  wakeLoopRef.current = wakeLoop
+
+  // Bind rAF once on mount. Cleanup cancels any pending frame.
+  useEffect(() => {
+    wakeLoopRef.current()
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+      rafRef.current = 0
+    }
+  }, [])
+
+  // Wake the loop on edits / state changes that should re-render the preview.
+  useEffect(() => { wakeLoopRef.current() },
+    [zooms, decimated, clicks, exportSettings, previewEnabled, session?.id])
 
   function spawnClickPulse(xNorm, yNorm, kind, tMs) {
     const id = `${tMs}-${Math.random().toString(36).slice(2, 6)}`
@@ -201,17 +362,20 @@ export default function Editor() {
     const onMeta = () => {
       if (isFinite(v.duration) && v.duration > 0) setDurationMs(v.duration * 1000)
     }
-    const onPlay = () => setIsPlaying(true)
-    const onPause = () => setIsPlaying(false)
+    const onPlay = () => { setIsPlaying(true); wakeLoopRef.current() }
+    const onPause = () => { setIsPlaying(false); wakeLoopRef.current() }
+    const onSeeking = () => wakeLoopRef.current()
     v.addEventListener('loadedmetadata', onMeta)
     v.addEventListener('durationchange', onMeta)
     v.addEventListener('play', onPlay)
     v.addEventListener('pause', onPause)
+    v.addEventListener('seeking', onSeeking)
     return () => {
       v.removeEventListener('loadedmetadata', onMeta)
       v.removeEventListener('durationchange', onMeta)
       v.removeEventListener('play', onPlay)
       v.removeEventListener('pause', onPause)
+      v.removeEventListener('seeking', onSeeking)
     }
   }, [])
 
@@ -245,11 +409,49 @@ export default function Editor() {
         selectAnnotation(null)
         setCenterPicking(false)
         setPendingAnnotation(null)
+      } else if ((e.key === 'z' || e.key === 'Z') && !meta) {
+        // Z = add a zoom region centered on the playhead. Same as the +Zoom
+        // button. (Lowercase z without modifiers; uppercase still works.)
+        e.preventDefault()
+        addZoomAtPlayhead()
+      } else if (e.key === 'ArrowLeft' && selectedZoomId) {
+        // Nudge selected zoom left. Shift = 5x (500ms).
+        e.preventDefault()
+        const step = e.shiftKey ? 500 : 100
+        const z = zooms.find((zz) => zz.id === selectedZoomId)
+        if (z) {
+          const moved = shiftZoom(z, -step, durationMs)
+          updateZoom(z.id, moved)
+        }
+      } else if (e.key === 'ArrowRight' && selectedZoomId) {
+        e.preventDefault()
+        const step = e.shiftKey ? 500 : 100
+        const z = zooms.find((zz) => zz.id === selectedZoomId)
+        if (z) {
+          const moved = shiftZoom(z, step, durationMs)
+          updateZoom(z.id, moved)
+        }
+      } else if (meta && e.key === 'd' && selectedZoomId) {
+        // Duplicate selected zoom 50ms to the right.
+        e.preventDefault()
+        const z = zooms.find((zz) => zz.id === selectedZoomId)
+        if (z) {
+          const len = z.end - z.start
+          const offset = Math.max(50, Math.min(durationMs - z.end, len + 200))
+          addZoomAction({
+            ...z,
+            id: `z${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+            start: z.start + offset,
+            peakStart: z.peakStart + offset,
+            peakEnd: z.peakEnd + offset,
+            end: z.end + offset
+          })
+        }
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [selectedZoomId, selectedAnnotationId, undo, redo])
+  }, [selectedZoomId, selectedAnnotationId, undo, redo, zooms, durationMs])
 
   useEffect(() => {
     const v = videoRef.current
@@ -308,35 +510,90 @@ export default function Editor() {
     }
   }
 
-  function onWrapperClick(e) {
+  // Click-and-drag annotation placement. mousedown sets the anchor; drag
+  // sizes the geometry; mouseup commits. If the user just clicks (no drag),
+  // we fall back to the per-kind default size from annotations.js so they
+  // don't end up with a 1-pixel arrow.
+  function onWrapperMouseDown(e) {
     if (!innerRef.current) return
+    if (e.button !== 0) return
     const rect = innerRef.current.getBoundingClientRect()
-    const cx = (e.clientX - rect.left) / rect.width
-    const cy = (e.clientY - rect.top) / rect.height
+    const cx0 = (e.clientX - rect.left) / rect.width
+    const cy0 = (e.clientY - rect.top) / rect.height
+
     if (centerPicking && selectedZoom) {
       updateZoom(selectedZoom.id, {
-        cx: Math.max(0.02, Math.min(0.98, cx)),
-        cy: Math.max(0.02, Math.min(0.98, cy))
+        cx: Math.max(0.02, Math.min(0.98, cx0)),
+        cy: Math.max(0.02, Math.min(0.98, cy0))
       })
       setCenterPicking(false)
       return
     }
-    if (pendingAnnotation) {
-      // Ignore clicks outside the inner clip area (padding region).
-      if (cx < 0 || cx > 1 || cy < 0 || cy > 1) return
-      const id = `ann-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
-      const start = currentMs
-      const end = Math.min(durationMs || start + 3000, start + 3000)
-      const baseGeom = { x: cx, y: cy, w: 0.18, h: 0.08 }
-      addAnnotation({
-        id,
-        ...pendingAnnotation,
-        ...baseGeom,
-        start,
-        end
-      })
-      setPendingAnnotation(null)
+    if (!pendingAnnotation) return
+    if (cx0 < 0 || cx0 > 1 || cy0 < 0 || cy0 > 1) return
+    e.preventDefault()
+
+    const id = `ann-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+    const start = currentMs
+    const dur = defaultDurationMsFor(pendingAnnotation)
+    const end = Math.min(durationMs || start + dur, start + dur)
+    // Optimistic insert at the click point with the per-kind default size.
+    // Drag will widen it; if user only clicks, this is the final size.
+    const def = defaultGeometryFor(pendingAnnotation)
+    // Counter annotations auto-number: text = (count of existing counters + 1).
+    const isCounter = pendingAnnotation.kind === 'text' && pendingAnnotation.styleId === 'counter'
+    const counterIdx = isCounter
+      ? annotations.filter((x) => x.styleId === 'counter').length + 1
+      : null
+    const baseAnn = {
+      id,
+      ...pendingAnnotation,
+      ...(isCounter ? { text: String(counterIdx) } : {}),
+      x: cx0,
+      y: cy0,
+      w: def.w,
+      h: def.h,
+      color: defaultColorFor(pendingAnnotation),
+      fadeInMs: DEFAULT_FADE_MS,
+      fadeOutMs: DEFAULT_FADE_MS,
+      ...(pendingAnnotation.kind === 'mask' && pendingAnnotation.maskId === 'blur'
+        ? { blurRadius: DEFAULT_BLUR_RADIUS }
+        : {}),
+      ...(pendingAnnotation.kind === 'mask' && pendingAnnotation.maskId === 'spotlight'
+        ? { spotlightDarkness: DEFAULT_SPOTLIGHT_DARKNESS }
+        : {}),
+      ...(pendingAnnotation.kind === 'mask' && pendingAnnotation.maskId === 'magnifier'
+        ? { magnifierZoom: DEFAULT_MAGNIFIER_ZOOM }
+        : {}),
+      start,
+      end
     }
+    addAnnotation(baseAnn)
+    setPendingAnnotation(null)
+
+    // Live drag-to-resize: if the user drags >6 px before releasing, switch
+    // to a "drag" geometry where (cx0,cy0) is one corner and the cursor is
+    // the opposite corner. Single-click users land with the default size.
+    let dragged = false
+    function onMove(ev) {
+      const cx1 = (ev.clientX - rect.left) / rect.width
+      const cy1 = (ev.clientY - rect.top) / rect.height
+      const dxPx = Math.abs(ev.clientX - e.clientX)
+      const dyPx = Math.abs(ev.clientY - e.clientY)
+      if (!dragged && Math.hypot(dxPx, dyPx) < 6) return
+      dragged = true
+      const x = (cx0 + cx1) / 2
+      const y = (cy0 + cy1) / 2
+      const w = Math.max(0.02, Math.abs(cx1 - cx0))
+      const h = Math.max(0.02, Math.abs(cy1 - cy0))
+      updateAnnotation(id, { x, y, w, h })
+    }
+    function onUp() {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
   }
 
   function moveSelectedZoom(id, newStart) {
@@ -367,9 +624,13 @@ export default function Editor() {
   const cursorW = cursorBaseW * exportSettings.cursorSize
   const cursorH = cursorBaseH * exportSettings.cursorSize
 
-  const activeAnnotations = annotations.filter(
-    (a) => currentMs >= a.start && currentMs <= a.end
-  )
+  // Include the active window AND the inbound/outbound fade margins so the
+  // preview shows the fade animation, not a hard pop.
+  const activeAnnotations = annotations.filter((a) => {
+    const inMs = a.fadeInMs ?? DEFAULT_FADE_MS
+    const outMs = a.fadeOutMs ?? DEFAULT_FADE_MS
+    return currentMs >= a.start - inMs && currentMs <= a.end + outMs
+  })
   const activeKeys = exportSettings.showKeystrokes
     ? keyEvents.filter(
         (k) =>
@@ -402,6 +663,30 @@ export default function Editor() {
 
       {/* Canvas + timeline */}
       <div className="flex-1 flex flex-col min-w-0">
+        {/* Banner when this recording captured no clicks — auto-zoom needs
+            them, so users know upfront that the editor will look "empty"
+            until they add zooms manually. */}
+        {session.events && clicks.length === 0 && (
+          <div
+            className="flex items-center gap-2 text-[12px]"
+            style={{
+              padding: '8px 16px',
+              background: 'rgba(252, 211, 77, 0.08)',
+              borderBottom: '1px solid rgba(252, 211, 77, 0.2)',
+              color: '#FCD34D'
+            }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" style={{ flexShrink: 0 }}>
+              <path d="M12 3l9 16H3l9-16z" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+              <path d="M12 10v4M12 17h.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            </svg>
+            <span>
+              No clicks were captured in this recording — auto-zoom has nothing to follow.
+              Press <kbd style={{ padding: '0 4px', borderRadius: 3, background: 'rgba(255,255,255,0.08)', fontFamily: 'monospace' }}>Z</kbd> to add zoom regions manually,
+              or re-record with Accessibility permission granted.
+            </span>
+          </div>
+        )}
         <div
           ref={wrapperRef}
           className="flex-1 flex items-center justify-center p-8 bg-[#0a0a0d] overflow-hidden"
@@ -426,7 +711,7 @@ export default function Editor() {
               centerPicking={centerPicking}
               hasPendingAnnotation={!!pendingAnnotation}
               innerRef={innerRef}
-              onClick={onWrapperClick}
+              onMouseDown={onWrapperMouseDown}
             >
               <video
                 ref={videoRef}
@@ -471,6 +756,8 @@ export default function Editor() {
                 onSelect={selectAnnotation}
                 onUpdate={updateAnnotation}
                 innerRef={innerRef}
+                currentMs={currentMs}
+                videoRef={videoRef}
               />
 
               {/* Camera PiP — uses the recorded webcam.webm if one was
@@ -560,6 +847,7 @@ export default function Editor() {
                 zooms={zooms}
                 selectedZoomId={selectedZoomId}
                 clicks={clicks}
+                videoSrc={videoSrc}
                 trim={trim}
                 onSeek={seek}
                 onSelectZoom={selectZoom}
@@ -589,7 +877,7 @@ export default function Editor() {
               <button
                 onClick={addZoomAtPlayhead}
                 className="px-3 h-9 rounded-md bg-panel2 hover:bg-panel2/70 text-sm flex items-center gap-1.5"
-                title="Add zoom at playhead"
+                title="Add zoom at playhead (Z)"
               >
                 <span className="text-base leading-none">+</span> Zoom
               </button>
@@ -606,7 +894,7 @@ export default function Editor() {
               Live zoom preview
             </label>
             <span className="text-muted/70">
-              Space ↔ play · ⌘Z undo · Drag handles to trim · Del to remove
+              Space play · Z add zoom · ←/→ nudge · ⌘D duplicate · ⌘Z undo · Del remove
             </span>
           </div>
         </div>
@@ -685,7 +973,7 @@ export default function Editor() {
         <div className="p-4 border-t border-panel2 bg-panel">
           <div className="flex gap-2">
             <button
-              onClick={() => goto('home')}
+              onClick={() => { reset(); goto('home') }}
               className="flex-1 px-4 py-2 rounded-md text-sm border border-panel2 hover:bg-panel2"
             >
               Discard
@@ -715,6 +1003,7 @@ function FramedCanvas({
   hasPendingAnnotation,
   innerRef,
   onClick,
+  onMouseDown,
   children
 }) {
   const shadowCss =
@@ -768,6 +1057,7 @@ function FramedCanvas({
     >
     <div
       onClick={onClick}
+      onMouseDown={onMouseDown}
       className={`relative ${cursorClass}`}
       style={{
         width: box.w || '100%',
@@ -986,7 +1276,7 @@ function ClickPulse({ pulse }) {
   return null
 }
 
-function AnnotationsLayer({ annotations, selectedId, onSelect, onUpdate, innerRef }) {
+function AnnotationsLayer({ annotations, selectedId, onSelect, onUpdate, innerRef, currentMs, videoRef }) {
   return (
     <div className="absolute inset-0 pointer-events-none">
       {annotations.map((a) => (
@@ -997,15 +1287,28 @@ function AnnotationsLayer({ annotations, selectedId, onSelect, onUpdate, innerRe
           onSelect={onSelect}
           onUpdate={onUpdate}
           innerRef={innerRef}
+          currentMs={currentMs}
+          videoRef={videoRef}
         />
       ))}
     </div>
   )
 }
 
-function AnnotationView({ annotation, selected, onSelect, onUpdate, innerRef }) {
+// Fade opacity based on currentMs vs annotation [start, end] window.
+function fadeOpacity(a, t) {
+  const inMs = a.fadeInMs ?? 180
+  const outMs = a.fadeOutMs ?? 180
+  if (t < a.start || t > a.end) return 0
+  const p = Math.min(1, (t - a.start) / Math.max(1, inMs))
+  const q = Math.min(1, (a.end - t) / Math.max(1, outMs))
+  return Math.max(0, Math.min(1, Math.min(p, q)))
+}
+
+function AnnotationView({ annotation, selected, onSelect, onUpdate, innerRef, currentMs, videoRef }) {
   const a = annotation
-  const ringClass = selected ? 'ring-2 ring-accent' : ''
+  const opacity = fadeOpacity(a, currentMs)
+  const dropShadow = 'drop-shadow(0 4px 16px rgba(0,0,0,0.45))'
 
   function startDrag(e) {
     e.stopPropagation()
@@ -1033,136 +1336,284 @@ function AnnotationView({ annotation, selected, onSelect, onUpdate, innerRef }) 
     window.addEventListener('mouseup', onUp)
   }
 
+  // Resize from a corner. `corner` ∈ {tl, tr, bl, br}. Drags that corner
+  // while keeping the opposite corner pinned. Updates x/y (center) + w/h.
+  function startResize(corner) {
+    return (e) => {
+      e.stopPropagation()
+      onSelect(a.id)
+      const wrap = innerRef.current
+      if (!wrap) return
+      const rect = wrap.getBoundingClientRect()
+      // Compute the OPPOSITE corner in normalized coords; it stays fixed.
+      const halfW = a.w / 2
+      const halfH = a.h / 2
+      const fixedX = corner.includes('l') ? a.x + halfW : a.x - halfW
+      const fixedY = corner.includes('t') ? a.y + halfH : a.y - halfH
+      function onMove(ev) {
+        const mx = (ev.clientX - rect.left) / rect.width
+        const my = (ev.clientY - rect.top) / rect.height
+        const nx = (fixedX + mx) / 2
+        const ny = (fixedY + my) / 2
+        const nw = Math.max(0.02, Math.abs(mx - fixedX))
+        const nh = Math.max(0.02, Math.abs(my - fixedY))
+        onUpdate(a.id, { x: nx, y: ny, w: nw, h: nh })
+      }
+      function onUp() {
+        window.removeEventListener('mousemove', onMove)
+        window.removeEventListener('mouseup', onUp)
+      }
+      window.addEventListener('mousemove', onMove)
+      window.addEventListener('mouseup', onUp)
+    }
+  }
+
   const baseStyle = {
     position: 'absolute',
     left: `${a.x * 100}%`,
     top: `${a.y * 100}%`,
     transform: 'translate(-50%,-50%)',
     pointerEvents: 'auto',
-    cursor: 'grab'
+    cursor: 'grab',
+    opacity,
+    transition: opacity > 0 && opacity < 1 ? 'opacity 80ms linear' : undefined
   }
 
+  // Selection ring + resize handles overlay. Sits on top of every kind so
+  // we don't need to inline it into each render branch.
+  const SelectionChrome = selected ? (
+    <>
+      <div
+        className="absolute inset-0 ring-2 ring-accent rounded pointer-events-none"
+        style={{ zIndex: 1 }}
+      />
+      {['tl', 'tr', 'bl', 'br'].map((c) => (
+        <div
+          key={c}
+          onMouseDown={startResize(c)}
+          className="absolute bg-accent border border-black/30"
+          style={{
+            width: 10,
+            height: 10,
+            borderRadius: 2,
+            left: c.includes('l') ? -5 : undefined,
+            right: c.includes('r') ? -5 : undefined,
+            top: c.includes('t') ? -5 : undefined,
+            bottom: c.includes('b') ? -5 : undefined,
+            cursor:
+              c === 'tl' || c === 'br' ? 'nwse-resize' : 'nesw-resize',
+            zIndex: 2
+          }}
+        />
+      ))}
+    </>
+  ) : null
+
   if (a.kind === 'text') {
-    const style = ANNOTATION_TEXT_STYLES.find((s) => s.id === a.styleId) || ANNOTATION_TEXT_STYLES[0]
+    const def = TEXT_DEFS_DATA[a.styleId] || TEXT_DEFS_DATA.plain
+    const text = a.text || def.label
+    const fontSize = Math.max(12, Math.round((a.h || 0.06) * 600 * 0.55)) // matches rasterizer ratio
+    const isTransparent = def.bg === 'transparent'
     return (
-      <div style={baseStyle} onMouseDown={startDrag} className={ringClass + ' rounded'}>
-        <div className={style.cls}>{a.text || style.preview}</div>
+      <div style={baseStyle} onMouseDown={startDrag}>
+        <div
+          style={{
+            position: 'relative',
+            background: a.bgColor || def.bg,
+            color: a.color && isTransparent ? a.color : def.fg,
+            padding: def.bg === 'transparent' ? 0 : `${def.padY}px ${def.padX}px`,
+            borderRadius: def.radius,
+            border: def.border ? `2px solid ${def.border}` : 'none',
+            font: `${def === TEXT_DEFS_DATA.badge ? 700 : 600} ${fontSize}px Inter, -apple-system, sans-serif`,
+            whiteSpace: 'nowrap',
+            filter: dropShadow,
+            minWidth: def === TEXT_DEFS_DATA.badge ? fontSize * 1.4 : undefined,
+            minHeight: def === TEXT_DEFS_DATA.badge ? fontSize * 1.4 : undefined,
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+          }}
+        >
+          {text}
+        </div>
+        {SelectionChrome}
       </div>
     )
   }
 
   if (a.kind === 'shape') {
+    const color = a.color || SHAPE_DEFS_DATA[a.shapeId]?.stroke || '#ffffff'
     const sizeW = `${a.w * 100}%`
     const sizeH = `${a.h * 100}%`
     if (a.shapeId === 'box') {
       return (
         <div
-          style={{ ...baseStyle, width: sizeW, height: sizeH }}
+          style={{ ...baseStyle, width: sizeW, height: sizeH, border: `3px solid ${color}`, filter: dropShadow }}
           onMouseDown={startDrag}
-          className={`border-2 border-pink-500 ${ringClass}`}
-        />
+        >
+          {SelectionChrome}
+        </div>
       )
     }
     if (a.shapeId === 'box-rounded') {
       return (
         <div
-          style={{ ...baseStyle, width: sizeW, height: sizeH }}
+          style={{ ...baseStyle, width: sizeW, height: sizeH, border: `3px solid ${color}`, borderRadius: 14, filter: dropShadow }}
           onMouseDown={startDrag}
-          className={`border-2 border-yellow-400 rounded-xl ${ringClass}`}
-        />
+        >
+          {SelectionChrome}
+        </div>
       )
     }
     if (a.shapeId === 'circle') {
       return (
         <div
-          style={{ ...baseStyle, width: sizeW, height: sizeH }}
+          style={{ ...baseStyle, width: sizeW, height: sizeH, border: `4px solid ${color}`, borderRadius: '50%', filter: dropShadow }}
           onMouseDown={startDrag}
-          className={`border-4 border-white/80 rounded-full ${ringClass}`}
-        />
+        >
+          {SelectionChrome}
+        </div>
       )
     }
-    if (a.shapeId === 'line' || a.shapeId === 'arrow' || a.shapeId === 'arrow-down') {
-      const isDown = a.shapeId === 'arrow-down'
+    if (a.shapeId === 'line' || a.shapeId === 'arrow') {
+      // Render as an SVG that fills the bounding box (matches the rasterizer).
+      const isArrow = a.shapeId === 'arrow'
       return (
-        <svg
-          width={isDown ? 60 : 120}
-          height={isDown ? 120 : 30}
-          viewBox={isDown ? '0 0 60 120' : '0 0 120 30'}
-          style={baseStyle}
-          onMouseDown={startDrag}
-          className={ringClass}
-        >
-          {a.shapeId === 'line' && (
-            <line x1="6" y1="15" x2="114" y2="15" stroke="#34d399" strokeWidth="4" strokeLinecap="round" />
-          )}
-          {a.shapeId === 'arrow' && (
-            <>
-              <line x1="6" y1="15" x2="106" y2="15" stroke="#ec4899" strokeWidth="4" strokeLinecap="round" />
-              <polygon points="106,5 116,15 106,25" fill="#ec4899" />
-            </>
-          )}
-          {isDown && (
-            <>
-              <line x1="30" y1="6" x2="30" y2="100" stroke="#ef4444" strokeWidth="4" strokeLinecap="round" />
-              <polygon points="20,100 40,100 30,114" fill="#ef4444" />
-            </>
-          )}
-        </svg>
+        <div style={{ ...baseStyle, width: sizeW, height: sizeH, filter: dropShadow }} onMouseDown={startDrag}>
+          <svg viewBox="0 0 100 30" preserveAspectRatio="none" width="100%" height="100%">
+            <line x1="4" y1="15" x2={isArrow ? 80 : 96} y2="15" stroke={color} strokeWidth="6" strokeLinecap="round" />
+            {isArrow && <polygon points="80,4 96,15 80,26" fill={color} />}
+          </svg>
+          {SelectionChrome}
+        </div>
+      )
+    }
+    if (a.shapeId === 'arrow-down') {
+      return (
+        <div style={{ ...baseStyle, width: sizeW, height: sizeH, filter: dropShadow }} onMouseDown={startDrag}>
+          <svg viewBox="0 0 30 100" preserveAspectRatio="none" width="100%" height="100%">
+            <line x1="15" y1="4" x2="15" y2="80" stroke={color} strokeWidth="6" strokeLinecap="round" />
+            <polygon points="4,80 26,80 15,96" fill={color} />
+          </svg>
+          {SelectionChrome}
+        </div>
       )
     }
   }
 
   if (a.kind === 'mask') {
     if (a.maskId === 'spotlight') {
-      // Cut-out lighting: dim everything except the spotlight area.
+      // Match the export's rasterized PNG: full-frame dim with a feathered
+      // elliptical hole. Implemented with two radial-gradient overlays so
+      // the preview is pixel-accurate to the MP4 within ~1%.
+      const darkness = a.spotlightDarkness ?? 0.55
+      const dimOpacity = darkness * opacity
       return (
-        <div
-          style={{
-            ...baseStyle,
-            width: `${a.w * 100}%`,
-            height: `${a.h * 100}%`,
-            boxShadow: '0 0 0 9999px rgba(0,0,0,0.55)',
-            borderRadius: '50%'
-          }}
-          onMouseDown={startDrag}
-          className={ringClass}
-        />
+        <>
+          <div
+            className="absolute inset-0 pointer-events-none"
+            style={{
+              background:
+                `radial-gradient(ellipse ${a.w * 50}% ${a.h * 50}% at ${a.x * 100}% ${a.y * 100}%,` +
+                ` transparent 60%,` +
+                ` rgba(0,0,0,${dimOpacity}) 100%)`
+            }}
+          />
+          {/* Invisible hitbox that owns drag + selection chrome */}
+          <div
+            style={{
+              ...baseStyle,
+              width: `${a.w * 100}%`,
+              height: `${a.h * 100}%`,
+              borderRadius: '50%',
+              border: selected ? '1px dashed rgba(255,255,255,0.6)' : 'none',
+              background: 'transparent'
+            }}
+            onMouseDown={startDrag}
+          >
+            {SelectionChrome}
+          </div>
+        </>
       )
     }
     if (a.maskId === 'blur') {
+      // Preview blur matches the export's effective radius. The rasterizer
+      // converts annotation.blurRadius (CSS px on a 1920-wide canvas) into
+      // FFmpeg's source-pixel radius. Here we show a CSS blur at the same
+      // logical radius.
+      const radiusPx = a.blurRadius || 16
       return (
         <div
           style={{
             ...baseStyle,
             width: `${a.w * 100}%`,
             height: `${a.h * 100}%`,
-            backdropFilter: 'blur(14px)',
-            background: 'rgba(0,0,0,0.05)'
+            backdropFilter: `blur(${radiusPx}px)`,
+            WebkitBackdropFilter: `blur(${radiusPx}px)`,
+            background: 'rgba(0,0,0,0.04)',
+            borderRadius: 8,
+            border: selected ? '1px dashed rgba(255,255,255,0.7)' : '1px solid rgba(255,255,255,0.2)'
           }}
           onMouseDown={startDrag}
-          className={ringClass + ' rounded-md'}
-        />
+        >
+          {SelectionChrome}
+        </div>
       )
     }
     if (a.maskId === 'magnifier') {
+      // Real magnifier preview: shows the underlying video pixels scaled up,
+      // clipped to a circle. We mirror the same video stream into a
+      // background-image-via-video trick — but that's expensive in CSS, so
+      // we use a transformed copy of the live <video> ref instead.
+      const zoomMag = a.magnifierZoom || 2.2
+      // The visible window covers (a.w, a.h) of the *frame*. We scale up
+      // the same frame and offset so the source region centered on (a.x, a.y)
+      // appears centered.
       return (
         <div
           style={{
             ...baseStyle,
             width: `${a.w * 100}%`,
             height: `${a.h * 100}%`,
-            border: '3px solid white',
             borderRadius: '50%',
-            background: 'rgba(255,255,255,0.05)'
+            overflow: 'hidden',
+            border: '2px solid rgba(255,255,255,0.85)',
+            boxShadow: '0 6px 22px rgba(0,0,0,0.45), inset 0 0 0 1px rgba(0,0,0,0.4)',
+            background: '#000'
           }}
           onMouseDown={startDrag}
-          className={ringClass}
-        />
+        >
+          <MagnifierContents zoom={zoomMag} opacity={opacity} />
+          {SelectionChrome}
+        </div>
       )
     }
   }
 
   return null
+}
+
+// Live magnifier preview. The accurate version would mount a second <video>
+// synced to the main one, CSS-scaled by `zoom`. That doubles decode cost so
+// for now the preview shows a styled lens (no magnification) and marks the
+// position correctly — the EXPORT renders true magnification (processor.js
+// crop+scale+alpha-mask). Preview parity is "approximate" for this one mask.
+function MagnifierContents({ zoom, opacity }) {
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        inset: 0,
+        opacity,
+        backdropFilter: `contrast(1.05) brightness(1.08) saturate(1.1)`,
+        WebkitBackdropFilter: `contrast(1.05) brightness(1.08) saturate(1.1)`,
+        boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.15)'
+      }}
+      // Hint text shown at the bottom-right inside the lens so the user
+      // knows the real magnification factor without surprise.
+      title={`Magnifier · ${zoom.toFixed(1)}× (preview is approximate; export is exact)`}
+    />
+  )
 }
 
 function PickerHint({ text }) {
@@ -1455,12 +1906,42 @@ function AnnotationsPanel({
               className="w-full bg-panel2 rounded px-2 py-1.5 text-sm outline-none focus:ring-1 focus:ring-accent"
             />
           )}
-          <Slider label="Width" value={selected.w || 0.18} min={0.05} max={0.9} step={0.01}
+          {(selected.kind === 'shape' || (selected.kind === 'text' && (selected.styleId === 'plain' || selected.styleId === 'outline'))) && (
+            <ColorPicker
+              label={selected.kind === 'shape' ? 'Stroke color' : 'Text color'}
+              value={selected.color || (selected.kind === 'shape'
+                ? (SHAPE_DEFS_DATA[selected.shapeId]?.stroke || '#ffffff')
+                : '#ffffff')}
+              onChange={(color) => onUpdate(selected.id, { color })}
+            />
+          )}
+          {selected.kind === 'mask' && selected.maskId === 'blur' && (
+            <Slider label="Blur radius" value={selected.blurRadius ?? 16} min={4} max={48} step={1}
+              format={(v) => `${v}px`}
+              onChange={(blurRadius) => onUpdate(selected.id, { blurRadius })} />
+          )}
+          {selected.kind === 'mask' && selected.maskId === 'spotlight' && (
+            <Slider label="Darkness" value={selected.spotlightDarkness ?? 0.55} min={0.1} max={0.95} step={0.05}
+              format={(v) => `${Math.round(v * 100)}%`}
+              onChange={(spotlightDarkness) => onUpdate(selected.id, { spotlightDarkness })} />
+          )}
+          {selected.kind === 'mask' && selected.maskId === 'magnifier' && (
+            <Slider label="Zoom" value={selected.magnifierZoom ?? 2.2} min={1.5} max={5} step={0.1}
+              format={(v) => `${v.toFixed(1)}×`}
+              onChange={(magnifierZoom) => onUpdate(selected.id, { magnifierZoom })} />
+          )}
+          <Slider label="Width" value={selected.w || 0.18} min={0.02} max={0.95} step={0.01}
             format={(v) => `${(v * 100).toFixed(0)}%`}
             onChange={(w) => onUpdate(selected.id, { w })} />
-          <Slider label="Height" value={selected.h || 0.08} min={0.03} max={0.9} step={0.01}
+          <Slider label="Height" value={selected.h || 0.08} min={0.02} max={0.95} step={0.01}
             format={(v) => `${(v * 100).toFixed(0)}%`}
             onChange={(h) => onUpdate(selected.id, { h })} />
+          <Slider label="Fade in" value={selected.fadeInMs ?? 180} min={0} max={1500} step={20}
+            format={(v) => (v ? `${(v / 1000).toFixed(2)}s` : 'Off')}
+            onChange={(fadeInMs) => onUpdate(selected.id, { fadeInMs })} />
+          <Slider label="Fade out" value={selected.fadeOutMs ?? 180} min={0} max={1500} step={20}
+            format={(v) => (v ? `${(v / 1000).toFixed(2)}s` : 'Off')}
+            onChange={(fadeOutMs) => onUpdate(selected.id, { fadeOutMs })} />
           <button
             onClick={() => onRemove(selected.id)}
             className="w-full text-sm px-3 py-2 rounded-md border border-red-500/30 text-red-300 hover:bg-red-500/10"

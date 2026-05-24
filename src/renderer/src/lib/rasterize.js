@@ -1,10 +1,17 @@
-// Renderer-side rasterizers. We turn the cursor SVG and the rounded-corner
-// mask into PNGs at export time, ship them to main via IPC, and let FFmpeg
-// reference the files in its filtergraph. Keeps the export visually in sync
-// with whatever the user picked in the editor without requiring native
-// raster libraries in the main process.
+// Renderer-side rasterizers. We turn the cursor SVG, the rounded-corner mask,
+// click-effect pulses, and each annotation into PNGs at export time, ship
+// them to main via IPC, and let FFmpeg reference the files in its
+// filtergraph. Keeps the export visually in sync with whatever the user
+// picked in the editor without requiring native raster libraries in main.
 
 import { findCursorStyle } from './cursors.js'
+import {
+  TEXT_STYLE_DEFS,
+  SHAPE_DEFS,
+  DEFAULT_BLUR_RADIUS,
+  DEFAULT_SPOTLIGHT_DARKNESS,
+  DEFAULT_FADE_MS
+} from './annotations.js'
 
 /**
  * Draws an SVG path-string into a 2D canvas. Honours the same fill / stroke /
@@ -14,9 +21,7 @@ import { findCursorStyle } from './cursors.js'
 function drawCursor(ctx, style, scale) {
   ctx.save()
   ctx.scale(scale, scale)
-  // The SVG path is authored in a 40×48 viewBox.
   const path = new Path2D(style.path)
-  // Fill: gradient or flat colour.
   if (style.fill && style.fill.startsWith('gradient:') && style.gradient) {
     const grad = ctx.createLinearGradient(0, 0, 40, 48)
     grad.addColorStop(0, style.gradient.from)
@@ -34,13 +39,6 @@ function drawCursor(ctx, style, scale) {
   ctx.restore()
 }
 
-/**
- * Rasterizes the chosen cursor style at a given total scale (combining
- * cursor-size slider × dpi) and returns a PNG ArrayBuffer.
- *
- * `scale=4` ≈ 160×192 px which gives crisp edges when FFmpeg overlays it on
- * a 4K canvas; the processor scales to the final cursor width afterwards.
- */
 export async function rasterizeCursor(styleId, scale = 4) {
   const style = findCursorStyle(styleId)
   const w = Math.round(40 * scale)
@@ -53,18 +51,11 @@ export async function rasterizeCursor(styleId, scale = 4) {
   return await blob.arrayBuffer()
 }
 
-/**
- * Builds a rounded-rectangle alpha mask: opaque white inside the rounded
- * rect, transparent outside. FFmpeg `alphamerge` strips the colour channels
- * and uses the luma as the alpha, so we just paint a solid white rectangle.
- */
 export async function rasterizeRoundedMask(width, height, radius) {
   const canvas = new OffscreenCanvas(width, height)
   const ctx = canvas.getContext('2d')
   ctx.clearRect(0, 0, width, height)
   ctx.fillStyle = '#ffffff'
-  // OffscreenCanvas gained roundRect in Chromium 99+; Electron 29 ships way
-  // past that, so we can rely on it directly.
   ctx.beginPath()
   ctx.roundRect(0, 0, width, height, radius)
   ctx.fill()
@@ -72,51 +63,139 @@ export async function rasterizeRoundedMask(width, height, radius) {
   return await blob.arrayBuffer()
 }
 
-// ----- Annotation rasterizer (text + shapes) -----
+// ----- Annotation rasterizer -----
 //
-// Each text style and each shape gets drawn into a transparent canvas at a
-// requested pixel size that mirrors the editor's CSS rendering as closely
-// as we can. The processor then overlays this PNG on the inner clip stream.
+// Each annotation gets drawn into a transparent canvas sized to its target
+// pixel footprint, plus a margin for the drop shadow so the blur isn't clipped.
+// The processor then overlays this PNG on the inner clip stream.
 //
-// `mask` annotations (spotlight/blur) are NOT rasterized — FFmpeg handles
-// those directly with boxblur / drawbox.
+// `mask` annotations (spotlight / magnifier) ARE rasterized into a full-frame
+// PNG; blur is FFmpeg-side (boxblur on the underlying video — overlay PNG
+// can't see the underlying pixels).
 
-const TEXT_STYLE_DEFS = {
-  plain:   { bg: 'transparent', color: '#ffffff', radius: 0,    border: null,                 padX: 0,  padY: 0  },
-  pill:    { bg: '#000000',     color: '#ffffff', radius: 9999, border: null,                 padX: 14, padY: 6  },
-  bubble:  { bg: '#8b5cf6',     color: '#ffffff', radius: 8,    border: null,                 padX: 14, padY: 6  },
-  glass:   { bg: 'rgba(255,255,255,0.18)', color: '#ffffff', radius: 8, border: 'rgba(255,255,255,0.35)', padX: 14, padY: 6 },
-  outline: { bg: 'transparent', color: '#ffffff', radius: 8,    border: '#ec4899',            padX: 14, padY: 6  },
-  badge:   { bg: '#bef264',     color: '#000000', radius: 9999, border: null,                 padX: 0,  padY: 0  }
+// Drop shadow that integrates the overlay into the video instead of looking
+// pasted on top. Matches `filter: drop-shadow(...)` rendered in the preview.
+const SHADOW = { offsetY: 4, blur: 16, color: 'rgba(0,0,0,0.45)' }
+const SHADOW_PAD = 28 // extra canvas margin so the shadow blur doesn't clip
+
+function applyShadow(ctx) {
+  ctx.shadowColor = SHADOW.color
+  ctx.shadowBlur = SHADOW.blur
+  ctx.shadowOffsetX = 0
+  ctx.shadowOffsetY = SHADOW.offsetY
 }
 
-function drawTextChip(ctx, text, w, h, def, fontSize) {
-  ctx.clearRect(0, 0, w, h)
-  ctx.font = `${def === TEXT_STYLE_DEFS.badge ? '700' : '600'} ${fontSize}px Inter, -apple-system, sans-serif`
+function clearShadow(ctx) {
+  ctx.shadowColor = 'transparent'
+  ctx.shadowBlur = 0
+  ctx.shadowOffsetX = 0
+  ctx.shadowOffsetY = 0
+}
+
+function drawTextChip(ctx, text, w, h, def, fontSize, color) {
+  const fg = color || def.fg || '#ffffff'
+  const bg = def.bg
+  ctx.font = `${def === TEXT_STYLE_DEFS.badge ? '700' : '600'} ${fontSize}px Inter, -apple-system, system-ui, sans-serif`
   ctx.textAlign = 'center'
   ctx.textBaseline = 'middle'
-  // Background pill
-  if (def.bg && def.bg !== 'transparent') {
-    ctx.fillStyle = def.bg
+  if (bg && bg !== 'transparent') {
+    applyShadow(ctx)
+    ctx.fillStyle = bg
     ctx.beginPath()
-    ctx.roundRect(0, 0, w, h, Math.min(def.radius, h / 2))
+    ctx.roundRect(SHADOW_PAD, SHADOW_PAD, w, h, Math.min(def.radius, h / 2))
     ctx.fill()
+    clearShadow(ctx)
   }
   if (def.border) {
     ctx.strokeStyle = def.border
     ctx.lineWidth = Math.max(2, fontSize * 0.12)
     ctx.beginPath()
     ctx.roundRect(
-      ctx.lineWidth / 2,
-      ctx.lineWidth / 2,
+      SHADOW_PAD + ctx.lineWidth / 2,
+      SHADOW_PAD + ctx.lineWidth / 2,
       w - ctx.lineWidth,
       h - ctx.lineWidth,
       Math.min(def.radius, h / 2)
     )
     ctx.stroke()
   }
-  ctx.fillStyle = def.color
-  ctx.fillText(text, w / 2, h / 2 + fontSize * 0.05)
+  // For plain (transparent bg) text we still want a subtle shadow so the
+  // text reads against busy backgrounds.
+  if (!bg || bg === 'transparent') {
+    ctx.save()
+    applyShadow(ctx)
+  }
+  ctx.fillStyle = fg
+  ctx.fillText(text, SHADOW_PAD + w / 2, SHADOW_PAD + h / 2 + fontSize * 0.05)
+  if (!bg || bg === 'transparent') ctx.restore()
+}
+
+function drawShape(ctx, shapeId, w, h, color) {
+  const stroke = color || SHAPE_DEFS[shapeId]?.stroke || '#ffffff'
+  ctx.strokeStyle = stroke
+  ctx.fillStyle = stroke
+  applyShadow(ctx)
+
+  if (shapeId === 'box') {
+    const lw = Math.max(3, Math.min(w, h) * 0.025)
+    ctx.lineWidth = lw
+    ctx.strokeRect(SHADOW_PAD + lw / 2, SHADOW_PAD + lw / 2, w - lw, h - lw)
+    return
+  }
+  if (shapeId === 'box-rounded') {
+    const lw = Math.max(3, Math.min(w, h) * 0.025)
+    ctx.lineWidth = lw
+    ctx.beginPath()
+    ctx.roundRect(SHADOW_PAD + lw / 2, SHADOW_PAD + lw / 2, w - lw, h - lw, Math.min(w, h) * 0.18)
+    ctx.stroke()
+    return
+  }
+  if (shapeId === 'circle') {
+    const lw = Math.max(4, Math.min(w, h) * 0.05)
+    ctx.lineWidth = lw
+    ctx.beginPath()
+    ctx.ellipse(SHADOW_PAD + w / 2, SHADOW_PAD + h / 2, (w - lw) / 2, (h - lw) / 2, 0, 0, Math.PI * 2)
+    ctx.stroke()
+    return
+  }
+  if (shapeId === 'line' || shapeId === 'arrow') {
+    const lw = Math.max(4, h * 0.4)
+    ctx.lineWidth = lw
+    ctx.lineCap = 'round'
+    const arrowH = shapeId === 'arrow' ? lw * 1.6 : 0
+    const midY = SHADOW_PAD + h / 2
+    ctx.beginPath()
+    ctx.moveTo(SHADOW_PAD + lw, midY)
+    ctx.lineTo(SHADOW_PAD + w - arrowH - lw / 2, midY)
+    ctx.stroke()
+    if (shapeId === 'arrow') {
+      ctx.beginPath()
+      ctx.moveTo(SHADOW_PAD + w - arrowH, midY - lw)
+      ctx.lineTo(SHADOW_PAD + w - 2, midY)
+      ctx.lineTo(SHADOW_PAD + w - arrowH, midY + lw)
+      ctx.closePath()
+      ctx.fill()
+    }
+    return
+  }
+  if (shapeId === 'arrow-down') {
+    const lw = Math.max(4, w * 0.4)
+    ctx.lineWidth = lw
+    ctx.lineCap = 'round'
+    const arrowH = lw * 1.6
+    const midX = SHADOW_PAD + w / 2
+    ctx.beginPath()
+    ctx.moveTo(midX, SHADOW_PAD + lw)
+    ctx.lineTo(midX, SHADOW_PAD + h - arrowH - lw / 2)
+    ctx.stroke()
+    ctx.beginPath()
+    ctx.moveTo(midX - lw, SHADOW_PAD + h - arrowH)
+    ctx.lineTo(midX, SHADOW_PAD + h - 2)
+    ctx.lineTo(midX + lw, SHADOW_PAD + h - arrowH)
+    ctx.closePath()
+    ctx.fill()
+    return
+  }
 }
 
 export async function rasterizeAnnotation(ann, innerW, innerH) {
@@ -125,102 +204,117 @@ export async function rasterizeAnnotation(ann, innerW, innerH) {
 
   if (ann.kind === 'text') {
     const def = TEXT_STYLE_DEFS[ann.styleId] || TEXT_STYLE_DEFS.plain
-    // Auto-pick font size from height; clamp to reasonable bounds.
     const fontSize = Math.max(14, Math.round(h * 0.55))
-    // For pill/badge styles we honour requested size; for plain text size
-    // by font (no padding), so we measure-and-fit.
-    const canvas = new OffscreenCanvas(w, h)
+    const canvasW = w + SHADOW_PAD * 2
+    const canvasH = h + SHADOW_PAD * 2
+    const canvas = new OffscreenCanvas(canvasW, canvasH)
     const ctx = canvas.getContext('2d')
-    drawTextChip(ctx, ann.text || ann.styleId, w, h, def, fontSize)
+    ctx.clearRect(0, 0, canvasW, canvasH)
+    drawTextChip(ctx, ann.text || def.label, w, h, def, fontSize, ann.bgColor || (ann.color && ann.styleId === 'plain' ? ann.color : null))
     const blob = await canvas.convertToBlob({ type: 'image/png' })
-    return { buffer: await blob.arrayBuffer(), w, h }
+    return { buffer: await blob.arrayBuffer(), w: canvasW, h: canvasH, pad: SHADOW_PAD }
   }
 
   if (ann.kind === 'shape') {
-    const canvas = new OffscreenCanvas(Math.max(w, 16), Math.max(h, 16))
+    const canvasW = w + SHADOW_PAD * 2
+    const canvasH = h + SHADOW_PAD * 2
+    const canvas = new OffscreenCanvas(canvasW, canvasH)
     const ctx = canvas.getContext('2d')
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
-    const cw = canvas.width
-    const ch = canvas.height
-    if (ann.shapeId === 'box') {
-      ctx.strokeStyle = '#ec4899'
-      ctx.lineWidth = Math.max(3, Math.min(cw, ch) * 0.025)
-      ctx.strokeRect(ctx.lineWidth / 2, ctx.lineWidth / 2, cw - ctx.lineWidth, ch - ctx.lineWidth)
-    } else if (ann.shapeId === 'box-rounded') {
-      ctx.strokeStyle = '#facc15'
-      const lw = Math.max(3, Math.min(cw, ch) * 0.025)
-      ctx.lineWidth = lw
-      ctx.beginPath()
-      ctx.roundRect(lw / 2, lw / 2, cw - lw, ch - lw, Math.min(cw, ch) * 0.18)
-      ctx.stroke()
-    } else if (ann.shapeId === 'circle') {
-      ctx.strokeStyle = '#ffffff'
-      ctx.lineWidth = Math.max(4, Math.min(cw, ch) * 0.04)
-      ctx.beginPath()
-      ctx.ellipse(cw / 2, ch / 2, (cw - ctx.lineWidth) / 2, (ch - ctx.lineWidth) / 2, 0, 0, Math.PI * 2)
-      ctx.stroke()
-    } else if (ann.shapeId === 'line' || ann.shapeId === 'arrow') {
-      const color = ann.shapeId === 'arrow' ? '#ec4899' : '#34d399'
-      const lw = Math.max(4, ch * 0.25)
-      ctx.strokeStyle = color
-      ctx.fillStyle = color
-      ctx.lineWidth = lw
-      ctx.lineCap = 'round'
-      const arrowH = ann.shapeId === 'arrow' ? lw * 1.6 : 0
-      ctx.beginPath()
-      ctx.moveTo(lw, ch / 2)
-      ctx.lineTo(cw - arrowH - lw / 2, ch / 2)
-      ctx.stroke()
-      if (ann.shapeId === 'arrow') {
-        ctx.beginPath()
-        ctx.moveTo(cw - arrowH, ch / 2 - lw)
-        ctx.lineTo(cw - 2, ch / 2)
-        ctx.lineTo(cw - arrowH, ch / 2 + lw)
-        ctx.closePath()
-        ctx.fill()
-      }
-    } else if (ann.shapeId === 'arrow-down') {
-      const color = '#ef4444'
-      const lw = Math.max(4, cw * 0.25)
-      ctx.strokeStyle = color
-      ctx.fillStyle = color
-      ctx.lineWidth = lw
-      ctx.lineCap = 'round'
-      const arrowH = lw * 1.6
-      ctx.beginPath()
-      ctx.moveTo(cw / 2, lw)
-      ctx.lineTo(cw / 2, ch - arrowH - lw / 2)
-      ctx.stroke()
-      ctx.beginPath()
-      ctx.moveTo(cw / 2 - lw, ch - arrowH)
-      ctx.lineTo(cw / 2, ch - 2)
-      ctx.lineTo(cw / 2 + lw, ch - arrowH)
-      ctx.closePath()
-      ctx.fill()
-    }
+    ctx.clearRect(0, 0, canvasW, canvasH)
+    drawShape(ctx, ann.shapeId, w, h, ann.color)
     const blob = await canvas.convertToBlob({ type: 'image/png' })
-    return { buffer: await blob.arrayBuffer(), w: canvas.width, h: canvas.height }
+    return { buffer: await blob.arrayBuffer(), w: canvasW, h: canvasH, pad: SHADOW_PAD }
   }
 
   if (ann.kind === 'mask' && ann.maskId === 'spotlight') {
     // Full-frame dark overlay with an elliptical "hole" at the annotation
-    // position. We return innerW×innerH; processor overlays at (0,0).
+    // position. The preview is now a matching ellipse (see Editor.jsx) so
+    // what you see is what you get.
+    const darkness = ann.spotlightDarkness ?? DEFAULT_SPOTLIGHT_DARKNESS
     const canvas = new OffscreenCanvas(innerW, innerH)
     const ctx = canvas.getContext('2d')
-    ctx.fillStyle = 'rgba(0,0,0,0.55)'
+    ctx.fillStyle = `rgba(0,0,0,${darkness})`
     ctx.fillRect(0, 0, innerW, innerH)
+    // Soften the edge a bit with a radial gradient before punching the hole.
     ctx.globalCompositeOperation = 'destination-out'
     const cx = ann.x * innerW
     const cy = ann.y * innerH
     const rx = (ann.w * innerW) / 2
     const ry = (ann.h * innerH) / 2
+    const grad = ctx.createRadialGradient(cx, cy, Math.min(rx, ry) * 0.6, cx, cy, Math.max(rx, ry))
+    grad.addColorStop(0, 'rgba(0,0,0,1)')
+    grad.addColorStop(1, 'rgba(0,0,0,0)')
+    ctx.fillStyle = grad
     ctx.beginPath()
     ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2)
     ctx.fill()
     ctx.globalCompositeOperation = 'source-over'
     const blob = await canvas.convertToBlob({ type: 'image/png' })
-    return { buffer: await blob.arrayBuffer(), w: innerW, h: innerH, fullFrame: true }
+    return { buffer: await blob.arrayBuffer(), w: innerW, h: innerH, fullFrame: true, pad: 0 }
   }
 
   return null
+}
+
+// ----- Click effect rasterizers -----
+//
+// These produce a SINGLE PNG for the peak frame of the effect. The processor
+// applies a fade-in + fade-out around each click time so the effect pulses
+// even though the source is a static image. Keeps the export path simple —
+// no per-frame procedural drawing needed.
+
+export async function rasterizeClickEffect(kind, sizePx = 220) {
+  const w = sizePx
+  const h = sizePx
+  const canvas = new OffscreenCanvas(w, h)
+  const ctx = canvas.getContext('2d')
+  ctx.clearRect(0, 0, w, h)
+  const cx = w / 2
+  const cy = h / 2
+
+  if (kind === 'ripple') {
+    // Soft filled disc — fades out via FFmpeg's overlay fade.
+    const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, w / 2)
+    grad.addColorStop(0, 'rgba(255,255,255,0.55)')
+    grad.addColorStop(1, 'rgba(255,255,255,0)')
+    ctx.fillStyle = grad
+    ctx.fillRect(0, 0, w, h)
+  } else if (kind === 'ring') {
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)'
+    ctx.lineWidth = 6
+    ctx.beginPath()
+    ctx.arc(cx, cy, w / 2 - 8, 0, Math.PI * 2)
+    ctx.stroke()
+  } else if (kind === 'spotlight') {
+    const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, w / 2)
+    grad.addColorStop(0, 'rgba(255,255,255,0.45)')
+    grad.addColorStop(0.6, 'rgba(255,255,255,0.08)')
+    grad.addColorStop(1, 'rgba(255,255,255,0)')
+    ctx.fillStyle = grad
+    ctx.fillRect(0, 0, w, h)
+  } else if (kind === 'sparkle') {
+    const spokes = 8
+    const inner = w * 0.04
+    const outer = w * 0.42
+    ctx.strokeStyle = '#fde047'
+    ctx.lineWidth = Math.max(2, w * 0.025)
+    ctx.lineCap = 'round'
+    for (let i = 0; i < spokes; i++) {
+      const a = (i * Math.PI * 2) / spokes
+      ctx.beginPath()
+      ctx.moveTo(cx + Math.cos(a) * inner, cy + Math.sin(a) * inner)
+      ctx.lineTo(cx + Math.cos(a) * outer, cy + Math.sin(a) * outer)
+      ctx.stroke()
+    }
+  } else {
+    return null
+  }
+  const blob = await canvas.convertToBlob({ type: 'image/png' })
+  return { buffer: await blob.arrayBuffer(), w, h }
+}
+
+export const DEFAULTS = {
+  fadeMs: DEFAULT_FADE_MS,
+  blurRadius: DEFAULT_BLUR_RADIUS,
+  spotlightDarkness: DEFAULT_SPOTLIGHT_DARKNESS
 }

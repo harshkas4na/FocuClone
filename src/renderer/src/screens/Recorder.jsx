@@ -5,6 +5,7 @@ export default function Recorder() {
   const source = useSession((s) => s.source)
   const micEnabled = useSession((s) => s.micEnabled)
   const micDeviceId = useSession((s) => s.micDeviceId)
+  const systemAudioEnabled = useSession((s) => s.systemAudioEnabled)
   const cameraEnabled = useSession((s) => s.cameraEnabled)
   const cameraDeviceId = useSession((s) => s.cameraDeviceId)
   const goto = useSession((s) => s.goto)
@@ -22,8 +23,24 @@ export default function Recorder() {
   const [error, setError] = useState(null)
   const [hookAvailable, setHookAvailable] = useState(true)
   const [showDiscardModal, setShowDiscardModal] = useState(false)
+  // Native ScreenCaptureKit path. Auto-on when the helper is built and the
+  // user picked a display (window-specific capture isn't wired yet). Toggle
+  // off to use the legacy MediaRecorder pipeline.
+  const [nativeAvailable, setNativeAvailable] = useState(false)
+  const [useNative, setUseNative] = useState(true)
+  const isNativeMode =
+    nativeAvailable && useNative && !!source && !!source.display_id
+  const usingNativeRef = useRef(false)
   const startedAtRef = useRef(0)
   const elapsedTimerRef = useRef(null)
+
+  useEffect(() => {
+    let cancelled = false
+    window.electronAPI.nativeRecorderAvailable?.().then((r) => {
+      if (!cancelled) setNativeAvailable(!!r?.available)
+    })
+    return () => { cancelled = true }
+  }, [])
 
   useEffect(() => {
     if (!source) {
@@ -95,6 +112,47 @@ export default function Recorder() {
       const screenW = screenInfo.width * (screenInfo.scaleFactor || 1)
       const screenH = screenInfo.height * (screenInfo.scaleFactor || 1)
 
+      // Native ScreenCaptureKit path. Drives the helper from main, no
+      // MediaRecorder, no chunk IPC. Falls through to MediaRecorder on any
+      // failure so a flaky helper never blocks recording.
+      if (isNativeMode) {
+        try {
+          const displayId = parseInt(source.display_id, 10) || 0
+          const init = await window.electronAPI.startNativeRecording({
+            displayId,
+            screenSize: { w: screenW, h: screenH },
+            width: screenW,
+            height: screenH,
+            fps: 60,
+            showCursor: true,
+            captureMic: !!micEnabled,
+            captureSystemAudio: !!systemAudioEnabled
+          })
+          if (!init || init.ok === false) {
+            throw new Error(init?.error || 'native start failed')
+          }
+          usingNativeRef.current = true
+          setHookAvailable(init.mouseTrackerAvailable)
+          startedAtRef.current = init.recordStart
+          // Stop the preview stream — ScreenCaptureKit owns the display now.
+          if (previewStreamRef.current) {
+            previewStreamRef.current.getTracks().forEach((t) => t.stop())
+            previewStreamRef.current = null
+          }
+          if (videoRef.current) videoRef.current.srcObject = null
+          setPhase('recording')
+          return
+        } catch (err) {
+          console.warn('[native] start failed, falling back', err)
+          setError(`Native recorder failed: ${err.message || err}. Using fallback.`)
+          usingNativeRef.current = false
+          // fall through to MediaRecorder path
+        }
+      }
+
+      // Capture at the display's full native pixel resolution where possible
+      // so exports stay sharp on HiDPI screens. desktopCapture clamps to the
+      // OS-reported display bounds, so passing screenW/H as max is safe.
       const captureStream = await navigator.mediaDevices.getUserMedia({
         audio: false,
         video: {
@@ -102,9 +160,9 @@ export default function Recorder() {
             chromeMediaSource: 'desktop',
             chromeMediaSourceId: source.id,
             minWidth: 1280,
-            maxWidth: 3840,
+            maxWidth: Math.max(3840, screenW),
             minHeight: 720,
-            maxHeight: 2160,
+            maxHeight: Math.max(2160, screenH),
             maxFrameRate: 60
           }
         }
@@ -186,13 +244,17 @@ export default function Recorder() {
           console.error('writeChunk failed', err)
         }
       }
+      const trackerAvailableAtStart = init.mouseTrackerAvailable
       recorder.onstop = async () => {
         const result = await window.electronAPI.stopRecording()
         setSession({
           ...result,
           screenW,
           screenH,
-          duration: result.duration
+          duration: result.duration,
+          // Persist tracker availability so Editor/Export can warn the user
+          // when zooms/cursor/keystrokes will be missing in the export.
+          mouseTrackerAvailable: trackerAvailableAtStart
         })
         setPhase('idle')
         goto('editor')
@@ -227,6 +289,26 @@ export default function Recorder() {
   }
 
   async function stopRecording() {
+    if (usingNativeRef.current) {
+      setPhase('stopping')
+      const result = await window.electronAPI.stopNativeRecording()
+      usingNativeRef.current = false
+      if (result?.ok) {
+        setSession({
+          ...result,
+          screenW: result.screenW,
+          screenH: result.screenH,
+          duration: result.duration,
+          mouseTrackerAvailable: result.mouseTrackerAvailable
+        })
+        setPhase('idle')
+        goto('editor')
+      } else {
+        setError(result?.error || 'native stop failed')
+        setPhase('idle')
+      }
+      return
+    }
     if (!recorderRef.current) return
     setPhase('stopping')
     recorderRef.current.stop()
@@ -243,6 +325,14 @@ export default function Recorder() {
   }
 
   async function cancelRecording() {
+    if (usingNativeRef.current) {
+      await window.electronAPI.cancelNativeRecording()
+      usingNativeRef.current = false
+      setPhase('idle')
+      setShowDiscardModal(false)
+      goto('home')
+      return
+    }
     if (recorderRef.current && recorderRef.current.state !== 'inactive') {
       try { recorderRef.current.stop() } catch {}
     }

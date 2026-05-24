@@ -11,6 +11,18 @@ const api = {
   writeChunk: (buffer) => ipcRenderer.invoke('write-chunk', buffer),
   writeWebcamChunk: (buffer) => ipcRenderer.invoke('write-webcam-chunk', buffer),
 
+  // Native ScreenCaptureKit recorder (macOS only). Returns
+  // {available, started:{outputPath,width,height,fps,displayId}} on success.
+  nativeRecorderAvailable: () => ipcRenderer.invoke('native-recorder-available'),
+  startNativeRecording: (opts) => ipcRenderer.invoke('start-native-recording', opts),
+  stopNativeRecording: () => ipcRenderer.invoke('stop-native-recording'),
+  cancelNativeRecording: () => ipcRenderer.invoke('cancel-native-recording'),
+  onNativeRecorderEvent: (cb) => {
+    const listener = (_e, evt) => cb(evt)
+    ipcRenderer.on('native-recorder-event', listener)
+    return () => ipcRenderer.removeListener('native-recorder-event', listener)
+  },
+
   saveTempAsset: (name, buffer) =>
     ipcRenderer.invoke('save-temp-asset', { name, buffer }),
   processVideo: (session, opts) => ipcRenderer.invoke('process-video', { session, opts }),

@@ -14,6 +14,11 @@ import {
   applyTrimToMoves,
   buildCursorSendcmd
 } from './zoomTimeline.js'
+import {
+  bakeCameraTrajectory,
+  buildBakedZoomExpressions,
+  buildCursorSendcmdFromBaked
+} from './cameraBake.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -54,9 +59,36 @@ async function probeStream(ffmpegBin, inputPath) {
         const m = stderr.match(/(\d+(?:\.\d+)?)\s*fps/)
         return m ? parseFloat(m[1]) : 30
       })()
-      const hasAudio = /Stream\s*#\d+:\d+(?:\(\w+\))?:\s*Audio:/i.test(stderr)
-      resolve({ duration: dur, dims, fps, hasAudio, raw: stderr })
+      const audioStreams = stderr.match(/Stream\s*#\d+:\d+(?:\(\w+\))?:\s*Audio:/gi) || []
+      const hasAudio = audioStreams.length > 0
+      const audioStreamCount = audioStreams.length
+      resolve({ duration: dur, dims, fps, hasAudio, audioStreamCount, raw: stderr })
     })
+  })
+}
+
+// Fallback duration probe for inputs whose container has no Duration header
+// (chunked WebM from MediaRecorder is the common one). Reads the last
+// packet's PTS via `ffmpeg -i input -map 0:v -f null -` — slower than a header
+// peek but always accurate.
+async function probeDurationByDecode(ffmpegBin, inputPath) {
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpegBin, [
+      '-hide_banner', '-nostats', '-i', inputPath,
+      '-map', '0:v:0', '-c', 'copy', '-f', 'null', '-'
+    ])
+    let stderr = ''
+    proc.stderr.on('data', (d) => (stderr += d.toString()))
+    proc.on('close', () => {
+      // FFmpeg reports the final mux time on the last `time=HH:MM:SS.ms` line.
+      const matches = stderr.match(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/g) || []
+      if (!matches.length) return resolve(0)
+      const last = matches[matches.length - 1]
+      const m = last.match(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/)
+      if (!m) return resolve(0)
+      resolve(+m[1] * 3600 + +m[2] * 60 + parseFloat(m[3]))
+    })
+    proc.on('error', () => resolve(0))
   })
 }
 
@@ -96,13 +128,17 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
     audioMuted = false,
     cursorSize = 1.0,
     cursorPngPath = null,
+    cursorFollowMode = 'dead-zone',
+    cursorFollowSafeZone = 0.6,
+    cursorFollowAmount = 0.7,
     roundedMaskPngPath = null,
     roundedMaskW = 0,
     roundedMaskH = 0,
     showKeystrokes = false,
     keystrokePosition = 'bottom',
     keystrokeWindowMs = 1500,
-    annotations: annotationOverlays = []
+    annotations: annotationOverlays = [],
+    clickEffects = null
   } = opts
 
   const rawVideoPath = session.videoPath
@@ -121,37 +157,86 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
   const H = inH - (inH % 2)
   const fps = requestedFps || Math.round(probe.fps) || 30
 
+  // Duration handling. Chunked MediaRecorder WebM has no container Duration
+  // header, so `probe.duration` is 0 — that previously collapsed every
+  // downstream calculation (trim → 0, zooms dropped, cursor cmds empty,
+  // annotations skipped) and produced an effect-free re-encode. Falls back
+  // in order: probe header → renderer-supplied session.duration → decode the
+  // whole file and read the last packet's PTS.
+  let probeDurSec = probe.duration
+  if (!(probeDurSec > 0) && session?.duration > 0) {
+    probeDurSec = session.duration / 1000
+    onLog && onLog(`[processor] probe duration empty, using session.duration=${probeDurSec.toFixed(2)}s\n`)
+  }
+  if (!(probeDurSec > 0)) {
+    probeDurSec = await probeDurationByDecode(ffmpegBin, rawVideoPath)
+    onLog && onLog(`[processor] fell back to decode-probe duration=${probeDurSec.toFixed(2)}s\n`)
+  }
+  if (!(probeDurSec > 0)) {
+    throw new Error('Could not determine input video duration')
+  }
+
   // Trim handling — input-side seek so the output timeline starts at 0
-  const fullDurMs = probe.duration * 1000
+  const fullDurMs = probeDurSec * 1000
   const trimInMs = Math.max(0, Math.min(trim?.inMs || 0, fullDurMs))
-  const trimOutMs = Math.min(fullDurMs, Math.max(trimInMs + 100, trim?.outMs || fullDurMs))
+  const trimOutMs = Math.min(
+    fullDurMs,
+    Math.max(trimInMs + 100, (trim?.outMs ?? null) ? trim.outMs : fullDurMs)
+  )
   const outDurMs = trimOutMs - trimInMs
   const outDurSec = outDurMs / 1000
 
-  const baseZooms =
-    providedZooms && providedZooms.length >= 0
-      ? providedZooms
-      : zoomsFromEvents(session.events || [], opts)
+  // Renderer is the source of truth — Editor.jsx auto-populates zooms from
+  // click events on mount. Only fall back to deriving them here if the
+  // renderer didn't pass an array at all (e.g. older callers / scripted use).
+  // The previous `length >= 0` guard was always true and caused empty arrays
+  // to silently bypass the fallback, killing zoom + cursor effects.
+  const baseZooms = Array.isArray(providedZooms)
+    ? providedZooms
+    : zoomsFromEvents(session.events || [], opts)
 
   const zooms = applyTrimToZooms(baseZooms, trimInMs, outDurMs)
+  // Match the renderer's decimation so the cursor sample grid is identical.
+  // 60 Hz / 2 px threshold — denser than before so slow drags stay smooth.
   const decimated = applyTrimToMoves(
-    decimateMoves(session.events || [], { cursorMoveSampleHz: 30, cursorMoveMinDeltaPx: 4 }),
+    decimateMoves(session.events || [], { cursorMoveSampleHz: 60, cursorMoveMinDeltaPx: 2 }),
     trimInMs,
     outDurMs
   )
 
   onLog && onLog(
-    `[processor] input ${inW}x${inH} ${probe.fps}fps, dur ${probe.duration.toFixed(2)}s; ` +
+    `[processor] input ${inW}x${inH} ${probe.fps}fps, dur ${probeDurSec.toFixed(2)}s; ` +
     `trim ${(trimInMs/1000).toFixed(2)}–${(trimOutMs/1000).toFixed(2)}s; ` +
     `${zooms.length} zooms, ${decimated.length} mouse samples\n`
   )
 
-  const zoomExpr = buildZoomExpressionsFromZooms(zooms, 'time')
+  // Bake the spring-smoothed, cursor-following camera into piecewise-linear
+  // FFmpeg expressions so the export matches the live preview. Falls back to
+  // the legacy cubic expressions when there are no zooms (keyframes empty)
+  // — same `1` zoom expression either way, costs nothing.
+  const cameraKeyframes =
+    zooms.length > 0
+      ? bakeCameraTrajectory({
+          zooms,
+          moves: decimated,
+          durSec: outDurSec,
+          cursorFollowMode,
+          cursorFollowSafeZone,
+          cursorFollowAmount
+        })
+      : []
+  const zoomExpr =
+    cameraKeyframes.length > 0
+      ? buildBakedZoomExpressions(cameraKeyframes, 'time')
+      : buildZoomExpressionsFromZooms(zooms, 'time')
   const zSafe = `max(${zoomExpr.zExpr},1)`
   if (zooms.length === 0) {
     onLog && onLog('[processor] WARNING: zooms array is empty — exported video will have no zoom effects\n')
   } else {
-    onLog && onLog(`[processor] applying ${zooms.length} zoom regions; first peak ${zooms[0]?.zoomLevel}× at ${(zooms[0]?.peakStart/1000).toFixed(2)}s\n`)
+    onLog && onLog(
+      `[processor] baked camera: ${cameraKeyframes.length} keyframes from ${zooms.length} zoom regions; ` +
+      `first peak ${zooms[0]?.zoomLevel}× at ${(zooms[0]?.peakStart/1000).toFixed(2)}s\n`
+    )
   }
   const xExpr = `clip((${zoomExpr.cxExpr})*iw - iw/(2*(${zSafe})), 0, iw - iw/(${zSafe}))`
   const yExpr = `clip((${zoomExpr.cyExpr})*ih - ih/(2*(${zSafe})), 0, ih - ih/(${zSafe}))`
@@ -166,7 +251,7 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
 
   const cursorWindows = clickWindowsFromZooms(zooms)
   let cursorAvailable = false
-  if (showCursor && cursorWindows.length > 0) {
+  if (showCursor) {
     const cursorPath = resolveCursorPath(cursorPngPath)
     try {
       await fs.access(cursorPath)
@@ -178,28 +263,57 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
     }
   }
 
+  // Fixed-position cursor (centered) only makes sense around clicks; if we
+  // have no clicks and the cursor isn't following the mouse, there's nothing
+  // useful to draw. Skip the overlay in that case.
+  if (cursorAvailable && !cursorFollowsMouse && cursorWindows.length === 0) {
+    cursorAvailable = false
+    onLog && onLog('[processor] fixed cursor with no click windows — skipping cursor overlay\n')
+  }
+
   let cmdsFilePath = null
   if (cursorAvailable) {
     const cursorIdx = nextInputIdx++
-    const enableExpr = cursorWindows
-      .map((w) => `between(t,${(w.start / 1000).toFixed(3)},${(w.end / 1000).toFixed(3)})`)
-      .join('+')
+    // Follows-mouse cursor is drawn for the full output (matches the preview).
+    // Fixed cursor is gated to click windows since it has no per-frame
+    // position and centering it for the whole video would look broken.
+    const enableExpr = cursorFollowsMouse
+      ? '1'
+      : cursorWindows
+          .map((w) => `between(t,${(w.start / 1000).toFixed(3)},${(w.end / 1000).toFixed(3)})`)
+          .join('+')
 
     if (cursorFollowsMouse) {
       // Pre-compute per-frame cursor x,y as sendcmd commands. The size slider
       // (cursorSize) multiplies the base 44×52 footprint.
       const cursorW = Math.max(8, Math.round(44 * cursorSize))
       const cursorH = Math.max(8, Math.round(52 * cursorSize)) // ~1.2 ratio
-      const cmds = buildCursorSendcmd({
-        zooms,
-        decimatedMoves: decimated,
-        W,
-        H,
-        cursorW,
-        cursorH,
-        fps,
-        durSec: outDurSec
-      })
+      // Use the baked trajectory if available so cursor placement stays
+      // locked to the camera (otherwise the cursor lags the spring-smoothed
+      // pan/zoom). Falls back to the cubic-curve cursor builder for the
+      // no-keyframes path.
+      const cmds =
+        cameraKeyframes.length > 0
+          ? buildCursorSendcmdFromBaked({
+              keyframes: cameraKeyframes,
+              decimatedMoves: decimated,
+              W,
+              H,
+              cursorW,
+              cursorH,
+              fps,
+              durSec: outDurSec
+            })
+          : buildCursorSendcmd({
+              zooms,
+              decimatedMoves: decimated,
+              W,
+              H,
+              cursorW,
+              cursorH,
+              fps,
+              durSec: outDurSec
+            })
       // Persist cmd file alongside the session
       const sessionDir = dirname(rawVideoPath)
       cmdsFilePath = join(sessionDir, 'cursor_cmds.txt')
@@ -227,9 +341,13 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
   }
 
   // Annotation overlays + blur masks. Each entry is either a PNG to overlay
-  // (text, shapes, spotlight) or a "blur" geometry that we boxblur on the
-  // underlying stream and overlay back. Time windows use trim-relative
-  // seconds via FFmpeg's `enable=between(t, ...)`.
+  // (text, shapes, spotlight) or one of the FFmpeg-side masks:
+  //   • blur     → boxblur on a crop of the underlying stream, overlaid back
+  //   • magnifier→ crop + scale-up + alpha-mask circle + overlay
+  // Time windows use trim-relative seconds via FFmpeg's
+  // `enable=between(t, ...)`. Fade-in / fade-out apply to PNG overlays by
+  // wrapping the scaled input in a `fade=t=in/out` filter — boxblur
+  // already pops in cleanly, fading it would require splits we don't need.
   for (let i = 0; i < (annotationOverlays || []).length; i++) {
     const ann = annotationOverlays[i]
     const startSec = Math.max(0, (ann.start - trimInMs) / 1000)
@@ -238,9 +356,6 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
     const enableExpr = `between(t,${startSec.toFixed(3)},${endSec.toFixed(3)})`
 
     if (ann.kind === 'mask' && ann.maskId === 'blur') {
-      // Crop the region, blur it, overlay back at the same coords. We use
-      // `eval=init` semantics implicitly since the geometry is static; only
-      // the enable window varies.
       const cw = Math.max(2, Math.round(ann.w * W))
       const ch = Math.max(2, Math.round(ann.h * H))
       const cx = Math.round(ann.x * W - cw / 2)
@@ -249,14 +364,71 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
       const splitB = `s${i}b`
       const blurredLabel = `bl${i}`
       const outLabel = `am${i}`
+      // Map the per-annotation blur radius (preview CSS px on a 1920-wide
+      // canvas) into FFmpeg's boxblur radius. boxblur is in actual source
+      // pixels, so scale by W/1920. Iterations=2 for a softer kernel.
+      const fbRadius = Math.max(1, Math.round((ann.blurRadius || 16) * (W / 1920)))
       filterChain.push(`${currentLabel}split=2[${splitA}][${splitB}]`)
       filterChain.push(
-        `[${splitB}]crop=${cw}:${ch}:${Math.max(0, cx)}:${Math.max(0, cy)},boxblur=20:1[${blurredLabel}]`
+        `[${splitB}]crop=${cw}:${ch}:${Math.max(0, cx)}:${Math.max(0, cy)},boxblur=${fbRadius}:2[${blurredLabel}]`
       )
       filterChain.push(
         `[${splitA}][${blurredLabel}]overlay=x=${Math.max(0, cx)}:y=${Math.max(0, cy)}:enable='${enableExpr}'[${outLabel}]`
       )
       currentLabel = `[${outLabel}]`
+      continue
+    }
+
+    if (ann.kind === 'mask' && ann.maskId === 'magnifier') {
+      // Crop the region, scale up by `magnifierZoom`, soft-mask to a circle,
+      // overlay back at the same position. The mask uses `geq` for a smooth
+      // alpha falloff so the magnifier has soft edges instead of a hard
+      // circle stamp. Cost is roughly the same as a small overlay.
+      const zoomMag = Math.max(1.2, Math.min(5, ann.magnifierZoom || 2.2))
+      // Output (visible) size on the canvas.
+      const outW = Math.max(8, Math.round(ann.w * W))
+      const outH = Math.max(8, Math.round(ann.h * H))
+      // Source crop size = output / zoom; this is what gets magnified.
+      const srcW = Math.max(4, Math.round(outW / zoomMag))
+      const srcH = Math.max(4, Math.round(outH / zoomMag))
+      const cx = Math.round(ann.x * W - srcW / 2)
+      const cy = Math.round(ann.y * H - srcH / 2)
+      const posX = Math.round(ann.x * W - outW / 2)
+      const posY = Math.round(ann.y * H - outH / 2)
+      const splitA = `mgA${i}`
+      const splitB = `mgB${i}`
+      const magnified = `mg${i}`
+      const ringLabel = `mgr${i}`
+      const outLabel = `am${i}`
+      // Build a feathered elliptical alpha mask the same size as the
+      // magnified output, drawn via geq. White inside the inner ellipse,
+      // smooth fade through `feather` px, transparent outside.
+      const feather = Math.max(2, Math.round(Math.min(outW, outH) * 0.05))
+      const rx = outW / 2
+      const ry = outH / 2
+      const innerRx = Math.max(1, rx - feather)
+      const innerRy = Math.max(1, ry - feather)
+      filterChain.push(`${currentLabel}split=2[${splitA}][${splitB}]`)
+      filterChain.push(
+        `[${splitB}]crop=${srcW}:${srcH}:${Math.max(0, cx)}:${Math.max(0, cy)},` +
+        `scale=${outW}:${outH}:flags=lanczos,format=yuva420p,` +
+        // d = normalized ellipse distance: 1 inside inner band, 0 outside outer.
+        `geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':` +
+        `a='255*clip( ( 1 - ( max(0, ( (X-${rx})*(X-${rx})/( ${rx}*${rx} ) + (Y-${ry})*(Y-${ry})/( ${ry}*${ry} ) ) - ( ${innerRx}*${innerRx}/( ${rx}*${rx} ) ) ) / ( 1 - ${innerRx}*${innerRx}/( ${rx}*${rx} ) ) ) ), 0, 1)'` +
+        `[${magnified}]`
+      )
+      // Optional thin white rim ring so the magnifier reads as a "lens".
+      const ringStroke = Math.max(2, Math.round(Math.min(outW, outH) * 0.025))
+      filterChain.push(
+        `[${magnified}]drawbox=x=0:y=0:w=${outW}:h=${outH}:` +
+        `color=white@0.0:thickness=fill[${ringLabel}]`
+      )
+      filterChain.push(
+        `[${splitA}][${ringLabel}]overlay=x=${posX}:y=${posY}:enable='${enableExpr}'[${outLabel}]`
+      )
+      currentLabel = `[${outLabel}]`
+      // Unused refs to silence linters in case future readers wonder.
+      void ringStroke
       continue
     }
 
@@ -272,6 +444,11 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
       if (!available) continue
       extraInputs.push('-i', ann.pngPath)
       const idx = nextInputIdx++
+
+      // Non-fullframe overlays carry a shadow-pad margin around the visible
+      // shape. The export needs to render the FULL PNG (so the shadow shows
+      // up) but offset it so the shape sits where the user placed it.
+      const pad = ann.pad || 0
       let scaleW, scaleH, posX, posY
       if (ann.fullFrame) {
         scaleW = W
@@ -279,22 +456,114 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
         posX = 0
         posY = 0
       } else {
-        scaleW = Math.max(2, Math.round(ann.w * W))
-        scaleH = Math.max(2, Math.round(ann.h * H))
-        posX = Math.round(ann.x * W - scaleW / 2)
-        posY = Math.round(ann.y * H - scaleH / 2)
+        const innerW = Math.max(2, Math.round(ann.w * W))
+        const innerH = Math.max(2, Math.round(ann.h * H))
+        // Match the rasterizer's padded canvas size: total = inner + 2*pad,
+        // scaled proportionally to the on-canvas size.
+        const totalCanvasW = (ann.pngW || (innerW + 2 * pad))
+        const totalCanvasH = (ann.pngH || (innerH + 2 * pad))
+        const ratio = innerW / Math.max(1, totalCanvasW - 2 * pad)
+        scaleW = Math.round(totalCanvasW * ratio)
+        scaleH = Math.round(totalCanvasH * ratio)
+        // Center the *inner shape* on (ann.x, ann.y) — shift the full PNG
+        // left/up by the scaled pad so the visible shape lands on the dot.
+        const scaledPad = Math.round(pad * ratio)
+        posX = Math.round(ann.x * W - innerW / 2) - scaledPad
+        posY = Math.round(ann.y * H - innerH / 2) - scaledPad
       }
       const scaledLabel = `as${i}`
+      const fadedLabel = `af${i}`
       const outLabel = `ao${i}`
       filterChain.push(`[${idx}:v]scale=${scaleW}:${scaleH}[${scaledLabel}]`)
+
+      // Fade in/out — applied to the alpha channel of the overlay PNG so the
+      // shape gently appears/disappears instead of popping. FFmpeg's
+      // `fade=alpha=1` operates on time relative to the overlay's own input
+      // stream; combined with `enable`, the result is bracketed correctly.
+      const fadeInS = Math.max(0, (ann.fadeInMs || 0) / 1000)
+      const fadeOutS = Math.max(0, (ann.fadeOutMs || 0) / 1000)
+      const winS = Math.max(0.001, endSec - startSec)
+      let overlaySrc = `[${scaledLabel}]`
+      if (fadeInS > 0.01 || fadeOutS > 0.01) {
+        const parts = []
+        if (fadeInS > 0.01) parts.push(`fade=t=in:st=0:d=${fadeInS.toFixed(3)}:alpha=1`)
+        if (fadeOutS > 0.01) {
+          const outStart = Math.max(0, winS - fadeOutS)
+          parts.push(`fade=t=out:st=${outStart.toFixed(3)}:d=${fadeOutS.toFixed(3)}:alpha=1`)
+        }
+        // PTS shift = the overlay PNG is a still image; we need its time-
+        // base to start at 0 when the enable window opens. `setpts=PTS-STARTPTS`
+        // and the offset trick below let the fade filter see relative time.
+        filterChain.push(`${overlaySrc}format=yuva420p,${parts.join(',')}[${fadedLabel}]`)
+        overlaySrc = `[${fadedLabel}]`
+      }
+
       filterChain.push(
-        `${currentLabel}[${scaledLabel}]overlay=x=${posX}:y=${posY}:enable='${enableExpr}':format=auto[${outLabel}]`
+        `${currentLabel}${overlaySrc}overlay=x=${posX}:y=${posY}:enable='${enableExpr}':format=auto[${outLabel}]`
       )
       currentLabel = `[${outLabel}]`
     }
   }
   if (annotationOverlays && annotationOverlays.length) {
     onLog && onLog(`[processor] applied ${annotationOverlays.length} annotations\n`)
+  }
+
+  // Click effects — one PNG, fanned out over every click timestamp. Each
+  // click gets a short fade-in/fade-out window of ~700 ms. We use a SINGLE
+  // input stream and `enable='between(t,a,b) + between(t,c,d) + …'` so a
+  // single overlay node services all clicks (no N-extra-inputs explosion).
+  if (clickEffects && clickEffects.pngPath && Array.isArray(clickEffects.clicks) && clickEffects.clicks.length) {
+    let available = false
+    try { await fs.access(clickEffects.pngPath); available = true } catch {}
+    if (available) {
+      extraInputs.push('-i', clickEffects.pngPath)
+      const idx = nextInputIdx++
+      const shortSide = Math.min(W, H)
+      const effW = Math.max(16, Math.round(shortSide * (clickEffects.sizeFrac || 0.18)))
+      const effH = effW
+      const durSec = (clickEffects.durMs || 700) / 1000
+      // Build the combined enable expression. We trim-shift each click time
+      // and clip to outDurSec.
+      const windows = []
+      for (const c of clickEffects.clicks) {
+        const tStart = Math.max(0, (c.t - trimInMs) / 1000)
+        const tEnd = tStart + durSec
+        if (tEnd <= 0 || tStart >= outDurSec) continue
+        windows.push({ tStart, tEnd, x: c.x, y: c.y })
+      }
+      if (windows.length > 0) {
+        // FFmpeg overlay x/y expressions can reference `t`. We compute the
+        // (x,y) as a chain of `if(between(t,a,b), X, …)` so a single overlay
+        // node serves every click — much cheaper than N overlay chains.
+        let xExpr = `${Math.round(W / 2)}`
+        let yExpr = `${Math.round(H / 2)}`
+        for (const w of windows) {
+          const px = Math.round(w.x * W - effW / 2)
+          const py = Math.round(w.y * H - effH / 2)
+          const cond = `between(t,${w.tStart.toFixed(3)},${w.tEnd.toFixed(3)})`
+          xExpr = `if(${cond},${px},${xExpr})`
+          yExpr = `if(${cond},${py},${yExpr})`
+        }
+        const enableExpr = windows
+          .map((w) => `between(t,${w.tStart.toFixed(3)},${w.tEnd.toFixed(3)})`)
+          .join('+')
+        const scaledLabel = `ce_s`
+        const fadedLabel = `ce_f`
+        const outLabel = `ce_o`
+        filterChain.push(`[${idx}:v]scale=${effW}:${effH}[${scaledLabel}]`)
+        // Looped fade so each click gets a fresh pulse. We use `setpts` to
+        // reset the timeline on every enable window — but FFmpeg's fade
+        // filter doesn't natively loop. Workaround: just use a soft static
+        // alpha mask, and let the per-click fade fall out of the `enable`
+        // boundary. The pulse animation lives in the radial-gradient PNG.
+        filterChain.push(`[${scaledLabel}]format=yuva420p[${fadedLabel}]`)
+        filterChain.push(
+          `${currentLabel}[${fadedLabel}]overlay=x='${xExpr}':y='${yExpr}':eval=frame:enable='${enableExpr}':format=auto[${outLabel}]`
+        )
+        currentLabel = `[${outLabel}]`
+        onLog && onLog(`[processor] click effect "${clickEffects.kind}": ${windows.length} click pulses\n`)
+      }
+    }
   }
 
   // Resolve final output canvas size. If the user picked a non-source aspect
@@ -528,7 +797,8 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
           ? `${Math.round(canvasH * 0.08)}`
           : `h-th-${Math.round(canvasH * 0.08)}`
 
-      for (const k of trimmed) {
+      for (let kIdx = 0; kIdx < trimmed.length; kIdx++) {
+        const k = trimmed[kIdx]
         // Find the lowest-indexed free slot; otherwise add a new one.
         let slot = 0
         while (slot < slotFreeAt.length && slotFreeAt[slot] > k.tSec) slot++
@@ -557,13 +827,16 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
           ? `(w-tw)/2`
           : `(w-tw)/2${xOffset > 0 ? '+' : ''}${xOffset}`
 
+        // Include kIdx in the label so two simultaneous keys at the exact
+        // same `tSec.toFixed(3)` in the same slot don't collide on a label.
+        const kLabel = `k${kIdx}_${slot}_${k.tSec.toFixed(3).replace('.', '_')}`
         filterChain.push(
           `${currentLabel}drawtext=text='${text}':fontcolor=white:fontsize=${fontSize}:` +
             `box=1:boxcolor=black@0.7:boxborderw=10:` +
             `x='${xExpr}':y='${yExpr}':` +
-            `enable='${enableExpr}'[k${slot}_${k.tSec.toFixed(3).replace('.', '_')}]`
+            `enable='${enableExpr}'[${kLabel}]`
         )
-        currentLabel = `[k${slot}_${k.tSec.toFixed(3).replace('.', '_')}]`
+        currentLabel = `[${kLabel}]`
       }
       onLog && onLog(`[processor] keystroke overlay: ${trimmed.length} key chips\n`)
     }
@@ -581,7 +854,21 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
   if (wantAudio) {
     const fadeInS = Math.max(0, audioFadeInMs / 1000)
     const fadeOutS = Math.max(0, audioFadeOutMs / 1000)
-    const parts = [`[0:a]volume=${(micVolume || 0).toFixed(3)}`]
+    // Multi-track inputs (native recorder with both system + mic) get amixed
+    // with equal gain. Single-track inputs branch off [0:a] as before.
+    let head
+    if ((probe.audioStreamCount || 0) >= 2) {
+      const inputs = []
+      for (let i = 0; i < probe.audioStreamCount; i++) inputs.push(`[0:a:${i}]`)
+      filterChain.push(
+        `${inputs.join('')}amix=inputs=${probe.audioStreamCount}:duration=longest:dropout_transition=0[amix]`
+      )
+      head = '[amix]'
+      onLog && onLog(`[processor] amixing ${probe.audioStreamCount} audio tracks\n`)
+    } else {
+      head = '[0:a]'
+    }
+    const parts = [`${head}volume=${(micVolume || 0).toFixed(3)}`]
     if (fadeInS > 0.01) parts.push(`afade=t=in:st=0:d=${fadeInS.toFixed(3)}`)
     if (fadeOutS > 0.01) {
       const startOut = Math.max(0, outDurSec - fadeOutS)

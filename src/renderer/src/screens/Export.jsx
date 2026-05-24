@@ -4,8 +4,10 @@ import { findBackground, aspectRatioOf } from '../lib/backgrounds.js'
 import {
   rasterizeCursor,
   rasterizeRoundedMask,
-  rasterizeAnnotation
+  rasterizeAnnotation,
+  rasterizeClickEffect
 } from '../lib/rasterize.js'
+import { DEFAULT_FADE_MS, DEFAULT_BLUR_RADIUS } from '../lib/annotations.js'
 
 const QUALITY_PRESETS = [
   { key: 'high',   name: 'High',   crf: 18, sub: 'CRF 18',  size: '~ Large',  best: 'Editing master' },
@@ -129,26 +131,43 @@ export default function Export() {
     const sourceAspect =
       session.screenW && session.screenH ? session.screenW / session.screenH : 16 / 9
     const targetAspect = aspectRatioOf(exportSettings.canvasAspect, sourceAspect)
-    // Use the source canvas (W×H) as our reference for annotation rasterization
-    // since they're applied on the inner stream (pre-letterbox).
-    const refW = session.screenW || 1920
-    const refH = session.screenH || 1080
+    // Rasterize annotations against a canonical 1920-wide reference rather
+    // than session.screenW: on Retina captures the recorded video can be at
+    // native pixels (e.g. 2880×1800) while screenW reports the logical CSS
+    // size (1440×900). Sizing the PNG to screen px and then asking FFmpeg to
+    // scale up to W×H produced soft/blurry text. A fixed 1920 reference keeps
+    // PNGs sharp and proportional, and FFmpeg's lanczos downscale handles the
+    // size change cleanly in either direction.
+    const refW = 1920
+    const refH = Math.round(refW / sourceAspect)
     const annotationsForExport = []
     for (const ann of annotations || []) {
       try {
-        // Blur + magnifier masks are FFmpeg-side: blur → boxblur on a crop;
-        // magnifier is unimplemented. Spotlight is a dark-with-hole PNG.
+        // Blur + magnifier masks operate on the underlying pixels — overlays
+        // can't see those, so processor.js handles both via FFmpeg
+        // filter primitives (boxblur + crop+scale, respectively).
         if (ann.kind === 'mask' && ann.maskId === 'blur') {
           annotationsForExport.push({
             kind: 'mask',
             maskId: 'blur',
             x: ann.x, y: ann.y, w: ann.w, h: ann.h,
-            start: ann.start, end: ann.end
+            blurRadius: ann.blurRadius ?? DEFAULT_BLUR_RADIUS,
+            start: ann.start, end: ann.end,
+            fadeInMs: ann.fadeInMs ?? DEFAULT_FADE_MS,
+            fadeOutMs: ann.fadeOutMs ?? DEFAULT_FADE_MS
           })
           continue
         }
         if (ann.kind === 'mask' && ann.maskId === 'magnifier') {
-          // TODO: implement on export side. Skip for now.
+          annotationsForExport.push({
+            kind: 'mask',
+            maskId: 'magnifier',
+            x: ann.x, y: ann.y, w: ann.w, h: ann.h,
+            magnifierZoom: ann.magnifierZoom ?? 2.2,
+            start: ann.start, end: ann.end,
+            fadeInMs: ann.fadeInMs ?? DEFAULT_FADE_MS,
+            fadeOutMs: ann.fadeOutMs ?? DEFAULT_FADE_MS
+          })
           continue
         }
 
@@ -162,19 +181,64 @@ export default function Export() {
           kind: ann.kind === 'mask' ? 'overlay' : ann.kind,
           pngPath: saved.path,
           // `fullFrame` overlays cover the whole inner stream (spotlight);
-          // others are positioned at the annotation's center.
+          // others are positioned at the annotation's center. The `pad`
+          // value is the drop-shadow margin we baked around the PNG — the
+          // processor offsets the overlay by -pad so the shape sits where
+          // the user placed it (not the shadow rim).
           fullFrame: !!rast.fullFrame,
           x: ann.x,
           y: ann.y,
           w: ann.w,
           h: ann.h,
+          pad: rast.pad || 0,
           pngW: rast.w,
           pngH: rast.h,
           start: ann.start,
-          end: ann.end
+          end: ann.end,
+          fadeInMs: ann.fadeInMs ?? DEFAULT_FADE_MS,
+          fadeOutMs: ann.fadeOutMs ?? DEFAULT_FADE_MS
         })
       } catch (err) {
         console.warn('annotation rasterize failed', ann, err)
+      }
+    }
+
+    // Click effects: render one PNG per effect kind and ship the click
+    // timestamps. The processor expands these into per-click overlays with
+    // a short fade-in / scale-up window so the export shows the same pulses
+    // the editor's rAF loop draws during preview.
+    let clickEffectsForExport = null
+    if (exportSettings.clickEffect && exportSettings.clickEffect !== 'none') {
+      try {
+        const eff = await rasterizeClickEffect(exportSettings.clickEffect, 240)
+        if (eff) {
+          const saved = await window.electronAPI.saveTempAsset(
+            `click-${exportSettings.clickEffect}-${Date.now()}.png`,
+            eff.buffer
+          )
+          // Normalize click positions to [0..1] using the session's
+          // screen size so processor.js doesn't need source dims.
+          const clickPoints = (session.events || [])
+            .filter((e) => e.type === 'click')
+            .map((e) => ({
+              t: e.timestamp,
+              x: session.screenW ? e.x / session.screenW : 0.5,
+              y: session.screenH ? e.y / session.screenH : 0.5
+            }))
+          clickEffectsForExport = {
+            kind: exportSettings.clickEffect,
+            pngPath: saved.path,
+            pngW: eff.w,
+            pngH: eff.h,
+            // Effect duration in ms. Matches the preview's 700 ms pulse.
+            durMs: 700,
+            // Visible size as fraction of canvas shorter side.
+            sizeFrac: exportSettings.clickEffect === 'spotlight' ? 0.5 : 0.18,
+            clicks: clickPoints
+          }
+        }
+      } catch (err) {
+        console.warn('click effect rasterize failed', err)
       }
     }
 
@@ -189,6 +253,7 @@ export default function Export() {
       roundedMaskW,
       roundedMaskH,
       annotations: annotationsForExport,
+      clickEffects: clickEffectsForExport,
       zooms,
       trim
     }
@@ -225,6 +290,24 @@ export default function Export() {
                   <span className="dot" />Ready
                 </span>
               </div>
+
+              {session.mouseTrackerAvailable === false && (
+                <div className="alert alert-warn" style={{ marginBottom: 20 }}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                    <path d="M12 3l9 16H3l9-16z" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+                    <path d="M12 10v4M12 17h.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                  </svg>
+                  <div>
+                    <div className="alert-title">No clicks or keystrokes were captured</div>
+                    <div className="alert-sub">
+                      The mouse-tracker hook wasn't available during this recording, so
+                      auto-zoom, cursor follow, and keystroke overlays will be missing
+                      from the export. Grant Accessibility permission and re-record to
+                      enable these effects.
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <section style={{ marginBottom: 24 }}>
                 <div className="label-eyebrow" style={{ display: 'block', marginBottom: 10 }}>Quality</div>

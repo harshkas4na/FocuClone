@@ -21,6 +21,7 @@ export const useSession = create((set, get) => ({
   source: null,
   micEnabled: false,
   micDeviceId: 'default',
+  systemAudioEnabled: false,
   cameraEnabled: false,
   cameraDeviceId: 'default',
   session: null,
@@ -33,11 +34,20 @@ export const useSession = create((set, get) => ({
   past: [],
   future: [],
   exportSettings: {
-    zoomLevel: 2.0,
-    easeInDuration: 280,
-    holdDuration: 1200,
-    easeOutDuration: 360,
-    minTimeBetweenZooms: 800,
+    // Defaults match DEFAULT_TIMELINE_OPTS in lib/zoomTimeline.js — continuous
+    // zoom model with click retargeting (FocuSee / Screen Studio feel).
+    zoomLevel: 1.5,
+    easeInDuration: 150,
+    holdDuration: 700,
+    easeOutDuration: 200,
+    clusterMergeGapMs: 2500,
+    clusterPadMs: 60,
+    // Camera-follow strategy during a held zoom. 'dead-zone' = anchor at the
+    // click; pan only when the cursor leaves the safe band. 'soft' = legacy
+    // constant-k follow.
+    cursorFollowMode: 'dead-zone',
+    cursorFollowSafeZone: 0.6, // fraction of viewport that's "free" for the cursor
+    cursorFollowAmount: 0.7,   // soft-follow strength when mode='soft'
     // Cursor
     showCursor: true,
     cursorFollowsMouse: true,
@@ -90,6 +100,7 @@ export const useSession = create((set, get) => ({
   setSource: (source) => set({ source }),
   setMicEnabled: (micEnabled) => set({ micEnabled }),
   setMicDeviceId: (micDeviceId) => set({ micDeviceId }),
+  setSystemAudioEnabled: (systemAudioEnabled) => set({ systemAudioEnabled }),
   setCameraEnabled: (cameraEnabled) => set({ cameraEnabled }),
   setCameraDeviceId: (cameraDeviceId) => set({ cameraDeviceId }),
   setSession: (session) => set({ session }),

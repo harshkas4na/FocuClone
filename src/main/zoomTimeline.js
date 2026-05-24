@@ -2,12 +2,15 @@
 // uses the exact same math as the live preview. Only the FFmpeg expression
 // builder + zoomsFromEvents/clickWindowsFromZooms are needed by main.
 
+// Mirror of the renderer's DEFAULT_TIMELINE_OPTS — keep in sync. See
+// renderer/src/lib/zoomTimeline.js for design notes.
 export const DEFAULT_TIMELINE_OPTS = {
-  zoomLevel: 2.0,
-  easeInDuration: 280,
-  holdDuration: 1200,
-  easeOutDuration: 360,
-  minTimeBetweenZooms: 800
+  zoomLevel: 1.5,
+  easeInDuration: 150,
+  holdDuration: 700,
+  easeOutDuration: 200,
+  clusterMergeGapMs: 2500,
+  clusterPadMs: 60
 }
 
 let _idSeq = 0
@@ -16,25 +19,83 @@ function makeId() {
   return `z${Date.now().toString(36)}${_idSeq}`
 }
 
+// Cluster nearby clicks into a single zoom region (see renderer copy for
+// full doc). Kept in lock-step with src/renderer/src/lib/zoomTimeline.js.
+function normClick(c) {
+  return {
+    nx: c.screenW > 0 ? c.x / c.screenW : 0.5,
+    ny: c.screenH > 0 ? c.y / c.screenH : 0.5
+  }
+}
+
 export function zoomsFromEvents(events, opts = {}) {
   const o = { ...DEFAULT_TIMELINE_OPTS, ...opts }
-  const clicks = (events || []).filter((e) => e.type === 'click')
-  const debounced = []
-  for (const c of clicks) {
-    const last = debounced[debounced.length - 1]
-    if (!last || c.timestamp - last.timestamp >= o.minTimeBetweenZooms) debounced.push(c)
+  const clicks = (events || [])
+    .filter((e) => e.type === 'click')
+    .slice()
+    .sort((a, b) => a.timestamp - b.timestamp)
+  if (!clicks.length) return []
+
+  const clusters = []
+  let cur = [clicks[0]]
+  for (let i = 1; i < clicks.length; i++) {
+    const c = clicks[i]
+    const prev = cur[cur.length - 1]
+    if (c.timestamp - prev.timestamp <= o.clusterMergeGapMs) cur.push(c)
+    else {
+      clusters.push(cur)
+      cur = [c]
+    }
   }
-  return debounced.map((c) => ({
-    id: makeId(),
-    source: 'click',
-    cx: c.screenW > 0 ? c.x / c.screenW : 0.5,
-    cy: c.screenH > 0 ? c.y / c.screenH : 0.5,
-    start: c.timestamp,
-    peakStart: c.timestamp + o.easeInDuration,
-    peakEnd: c.timestamp + o.easeInDuration + o.holdDuration,
-    end: c.timestamp + o.easeInDuration + o.holdDuration + o.easeOutDuration,
-    zoomLevel: o.zoomLevel
-  }))
+  clusters.push(cur)
+
+  return clusters.map((cluster) => {
+    const first = cluster[0]
+    const last = cluster[cluster.length - 1]
+    const anchors = cluster.map((c) => {
+      const n = normClick(c)
+      return { t: c.timestamp, cx: n.nx, cy: n.ny }
+    })
+    const lastN = normClick(last)
+    const start = Math.max(0, first.timestamp - o.clusterPadMs)
+    const peakStart = start + o.easeInDuration
+    const peakEnd = Math.max(peakStart + 50, last.timestamp + o.holdDuration)
+    const end = peakEnd + o.easeOutDuration
+    return {
+      id: makeId(),
+      source: 'click',
+      cx: lastN.nx,
+      cy: lastN.ny,
+      anchors: cluster.length > 1 ? anchors : undefined,
+      start,
+      peakStart,
+      peakEnd,
+      end,
+      zoomLevel: o.zoomLevel,
+      clusterSize: cluster.length
+    }
+  })
+}
+
+// Resolve camera (cx, cy) target for a zoom region at the given time.
+// Mirror of renderer/lib/zoomTimeline.js#anchorAt.
+export function anchorAt(zoom, tMs) {
+  if (!zoom.anchors || zoom.anchors.length === 0) {
+    return { cx: zoom.cx, cy: zoom.cy }
+  }
+  if (tMs <= zoom.anchors[0].t) return { cx: zoom.anchors[0].cx, cy: zoom.anchors[0].cy }
+  const lastIdx = zoom.anchors.length - 1
+  if (tMs >= zoom.anchors[lastIdx].t) {
+    return { cx: zoom.anchors[lastIdx].cx, cy: zoom.anchors[lastIdx].cy }
+  }
+  let lo = 0
+  let hi = lastIdx
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1
+    if (zoom.anchors[mid].t <= tMs) lo = mid
+    else hi = mid
+  }
+  return { cx: zoom.anchors[lo].cx, cy: zoom.anchors[lo].cy }
 }
 
 // Decimate raw move events to a coarse polyline — one point per ~50ms
@@ -86,10 +147,30 @@ export function sampleMouseAt(decimated, tMs, fallback = { x: 0.5, y: 0.5 }) {
 // Sample (zoom, cx, cy) at time t — same logic as the renderer.
 function easeOutCubic(p) { return 1 - Math.pow(1 - p, 3) }
 function easeInCubic(p) { return p * p * p }
+
+export function activeZoomAt(zooms, tMs) {
+  let best = null
+  let bestEase = 0
+  for (const w of zooms || []) {
+    if (tMs < w.start || tMs > w.end) continue
+    let ease
+    if (tMs <= w.peakStart) ease = easeOutCubic((tMs - w.start) / Math.max(1, w.peakStart - w.start))
+    else if (tMs >= w.peakEnd) ease = easeInCubic((w.end - tMs) / Math.max(1, w.end - w.peakEnd))
+    else ease = 1
+    if (ease >= bestEase) { bestEase = ease; best = w }
+  }
+  return best
+}
+
+// Renderer-side mirror is named `sampleZoomFromZooms`; keep both names so
+// either side imports cleanly.
+export const sampleZoomFromZooms = sampleZoomAt
+
 export function sampleZoomAt(zooms, tMs) {
   let bestZ = 1
-  let bestCx = 0.5
-  let bestCy = 0.5
+  let cxAccum = 0
+  let cyAccum = 0
+  let weightAccum = 0
   for (const w of zooms || []) {
     if (tMs < w.start || tMs > w.end) continue
     let ease
@@ -97,13 +178,19 @@ export function sampleZoomAt(zooms, tMs) {
     else if (tMs >= w.peakEnd) ease = easeInCubic((w.end - tMs) / Math.max(1, w.end - w.peakEnd))
     else ease = 1
     const z = 1 + (w.zoomLevel - 1) * ease
-    if (z > bestZ) { bestZ = z; bestCx = w.cx; bestCy = w.cy }
+    if (z > bestZ) bestZ = z
+    const a = anchorAt(w, tMs)
+    cxAccum += a.cx * ease
+    cyAccum += a.cy * ease
+    weightAccum += ease
   }
-  return { zoom: bestZ, cx: bestCx, cy: bestCy }
+  if (weightAccum <= 0) return { zoom: 1, cx: 0.5, cy: 0.5 }
+  return { zoom: bestZ, cx: cxAccum / weightAccum, cy: cyAccum / weightAccum }
 }
 
 // Shift all zooms by -trimInMs and drop those entirely outside [0, durMs].
-// Clamp partially-overlapping ones to the trim range.
+// Clamp partially-overlapping ones to the trim range. Per-click anchors get
+// the same shift so the camera continues to retarget correctly after trim.
 export function applyTrimToZooms(zooms, trimInMs, durMs) {
   const shifted = []
   for (const z of zooms || []) {
@@ -112,12 +199,18 @@ export function applyTrimToZooms(zooms, trimInMs, durMs) {
     if (end <= 0 || start >= durMs) continue
     const peakStart = Math.max(start, z.peakStart - trimInMs)
     const peakEnd = Math.min(end, z.peakEnd - trimInMs)
+    const anchors = Array.isArray(z.anchors)
+      ? z.anchors
+          .map((a) => ({ ...a, t: a.t - trimInMs }))
+          .filter((a) => a.t >= 0 && a.t <= durMs)
+      : undefined
     shifted.push({
       ...z,
       start: Math.max(0, start),
       peakStart: Math.max(0, peakStart),
       peakEnd: Math.min(durMs, peakEnd),
-      end: Math.min(durMs, end)
+      end: Math.min(durMs, end),
+      anchors: anchors && anchors.length > 1 ? anchors : undefined
     })
   }
   return shifted
