@@ -58,6 +58,8 @@ function Stepper() {
   const session = useSession((s) => s.session)
   const source = useSession((s) => s.source)
 
+  const recordingActive = useSession((s) => s.recordingActive)
+
   const currentIdx = STEPS.findIndex((s) => s.id === screen)
 
   // Available steps depend on app state to avoid breaking flow:
@@ -66,6 +68,9 @@ function Stepper() {
   // - Edit:   needs a finalised session
   // - Export: needs a finalised session
   function isAvailable(id, idx) {
+    // A live recording owns the app — navigating away would leave the
+    // MediaRecorder / native helper running with no way to stop it.
+    if (recordingActive) return false
     if (id === 'home') return true
     if (id === 'record') return !!source
     if (id === 'editor') return !!session

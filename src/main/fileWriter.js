@@ -44,19 +44,48 @@ export function appendChunk(buffer) {
   })
 }
 
+// Webcam writer that isn't tied to a MediaRecorder session — used by the
+// native ScreenCaptureKit path, where the screen goes straight to mp4 but
+// the webcam still streams webm chunks from the renderer.
+let standaloneWebcam = null
+
+export async function startStandaloneWebcam(path) {
+  standaloneWebcam = { path, writer: createWriteStream(path), bytes: 0 }
+  return { path }
+}
+
+export async function finalizeStandaloneWebcam() {
+  if (!standaloneWebcam) return null
+  const { path, writer, bytes } = standaloneWebcam
+  await new Promise((resolve) => writer.end(resolve))
+  standaloneWebcam = null
+  return bytes > 0 ? { path, bytes } : null
+}
+
+export async function discardStandaloneWebcam() {
+  if (!standaloneWebcam) return
+  const { path, writer } = standaloneWebcam
+  await new Promise((resolve) => writer.end(resolve))
+  await fs.rm(path, { force: true }).catch(() => {})
+  standaloneWebcam = null
+}
+
 export function appendWebcamChunk(buffer) {
-  if (
-    !activeSession ||
-    !activeSession.webcamWriter ||
-    activeSession.webcamWriter.writableEnded
-  ) {
-    return Promise.resolve(0)
-  }
+  const target =
+    activeSession && activeSession.webcamWriter && !activeSession.webcamWriter.writableEnded
+      ? activeSession
+      : standaloneWebcam && !standaloneWebcam.writer.writableEnded
+        ? standaloneWebcam
+        : null
+  if (!target) return Promise.resolve(0)
+  const isSession = target === activeSession
   return new Promise((resolve, reject) => {
-    activeSession.webcamBytes += buffer.byteLength
-    activeSession.webcamWriter.write(Buffer.from(buffer), (err) => {
+    if (isSession) target.webcamBytes += buffer.byteLength
+    else target.bytes += buffer.byteLength
+    const writer = isSession ? target.webcamWriter : target.writer
+    writer.write(Buffer.from(buffer), (err) => {
       if (err) reject(err)
-      else resolve(activeSession.webcamBytes)
+      else resolve(isSession ? target.webcamBytes : target.bytes)
     })
   })
 }

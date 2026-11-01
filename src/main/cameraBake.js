@@ -262,6 +262,28 @@ export function buildBakedZoomExpressions(keyframes, timeVar = 'time') {
   }
 }
 
+// Sample the baked (z, cx, cy) trajectory at arbitrary tMs (binary search +
+// lerp). Used for cursor placement and for positioning click-effect pulses
+// on the zoomed output frame.
+export function sampleBakedTrajectory(keyframes, tMs) {
+  if (!keyframes || !keyframes.length) return { z: 1, cx: 0.5, cy: 0.5 }
+  if (tMs <= keyframes[0].t) return keyframes[0]
+  const last = keyframes[keyframes.length - 1]
+  if (tMs >= last.t) return last
+  let lo = 0
+  let hi = keyframes.length - 1
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1
+    if (keyframes[mid].t <= tMs) lo = mid
+    else hi = mid
+  }
+  const a = keyframes[lo]
+  const b = keyframes[hi]
+  const span = b.t - a.t
+  const p = span > 0 ? (tMs - a.t) / span : 0
+  return { z: a.z + (b.z - a.z) * p, cx: a.cx + (b.cx - a.cx) * p, cy: a.cy + (b.cy - a.cy) * p }
+}
+
 // Replacement for buildCursorSendcmd that consumes the baked trajectory
 // instead of recomputing zoom math, so cursor placement stays in lock-step
 // with the camera. Output format matches the original — `overlay@ov` x/y

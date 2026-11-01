@@ -14,6 +14,9 @@ export default function Home() {
   const micDeviceId = useSession((s) => s.micDeviceId)
   const cameraEnabled = useSession((s) => s.cameraEnabled)
   const setCameraEnabled = useSession((s) => s.setCameraEnabled)
+  const cameraDeviceId = useSession((s) => s.cameraDeviceId)
+  const setCameraDeviceId = useSession((s) => s.setCameraDeviceId)
+  const [cameras, setCameras] = useState([])
   const goto = useSession((s) => s.goto)
   const selectedId = useSession((s) => s.source?.id)
 
@@ -67,6 +70,34 @@ export default function Home() {
     navigator.mediaDevices.addEventListener?.('devicechange', onChange)
     return () => navigator.mediaDevices.removeEventListener?.('devicechange', onChange)
   }, [micEnabled, loadMics])
+
+  // Enumerate cameras once the toggle is on (labels need a granted stream).
+  useEffect(() => {
+    if (!cameraEnabled) return
+    let cancelled = false
+    async function loadCams() {
+      try {
+        const probe = await navigator.mediaDevices.getUserMedia({ video: true })
+        probe.getTracks().forEach((t) => t.stop())
+        const devs = await navigator.mediaDevices.enumerateDevices()
+        if (cancelled) return
+        setCameras(
+          devs
+            .filter((d) => d.kind === 'videoinput')
+            .map((d) => ({ deviceId: d.deviceId, label: d.label || 'Camera' }))
+        )
+      } catch {
+        if (!cancelled) setCameras([])
+      }
+    }
+    loadCams()
+    const onChange = () => loadCams()
+    navigator.mediaDevices.addEventListener?.('devicechange', onChange)
+    return () => {
+      cancelled = true
+      navigator.mediaDevices.removeEventListener?.('devicechange', onChange)
+    }
+  }, [cameraEnabled])
 
   const screens = sources.filter((s) => s.id.startsWith('screen:'))
   const windows = sources.filter((s) => s.id.startsWith('window:'))
@@ -209,7 +240,7 @@ export default function Home() {
                 permission={micPermission}
                 onRequest={loadMics}
               />
-              <VuMeter active={mics.length > 0} />
+              <VuMeter active={mics.length > 0} deviceId={micDeviceId} />
             </div>
           )}
           {micEnabled && micPermission === 'denied' && (
@@ -239,7 +270,13 @@ export default function Home() {
             </span>
             <div className="row-text">
               <div className="row-title">Camera</div>
-              <div className="row-sub">{cameraEnabled ? 'FaceTime HD Camera' : 'Off'}</div>
+              <div className="row-sub">
+                {cameraEnabled
+                  ? cameras.find((c) => c.deviceId === cameraDeviceId)?.label ||
+                    cameras[0]?.label ||
+                    'Detecting…'
+                  : 'Off'}
+              </div>
             </div>
             <button
               className={`toggle ${cameraEnabled ? 'on' : ''}`}
@@ -248,9 +285,20 @@ export default function Home() {
             />
           </div>
           {cameraEnabled && (
-            <div className="cam-preview">
-              <div className="cam-bg" />
-              <div className="cam-label">FaceTime HD</div>
+            <div className="row-sub-detail">
+              {cameras.length > 1 && (
+                <select
+                  value={cameraDeviceId}
+                  onChange={(e) => setCameraDeviceId(e.target.value)}
+                  className="input"
+                  style={{ width: '100%' }}
+                >
+                  {cameras.map((c) => (
+                    <option key={c.deviceId} value={c.deviceId}>{c.label}</option>
+                  ))}
+                </select>
+              )}
+              <CameraLivePreview deviceId={cameraDeviceId} />
             </div>
           )}
         </div>
@@ -284,33 +332,121 @@ export default function Home() {
   )
 }
 
-function VuMeter({ active }) {
-  const [tick, setTick] = React.useState(0)
+// Real input level meter. Opens the selected mic, runs an AnalyserNode, and
+// lights bars from measured RMS — the previous version was a sine-wave
+// animation that moved even with the mic unplugged.
+function VuMeter({ active, deviceId }) {
+  const [level, setLevel] = React.useState(0) // 0..1
   React.useEffect(() => {
     if (!active) return
-    let raf
-    const loop = () => {
-      setTick((t) => t + 1)
-      raf = requestAnimationFrame(loop)
+    let cancelled = false
+    let stream = null
+    let ac = null
+    let raf = 0
+    async function start() {
+      try {
+        const constraint =
+          deviceId && deviceId !== 'default' ? { deviceId: { exact: deviceId } } : true
+        stream = await navigator.mediaDevices.getUserMedia({ audio: constraint, video: false })
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop())
+          return
+        }
+        ac = new (window.AudioContext || window.webkitAudioContext)()
+        const src = ac.createMediaStreamSource(stream)
+        const analyser = ac.createAnalyser()
+        analyser.fftSize = 512
+        src.connect(analyser)
+        const buf = new Float32Array(analyser.fftSize)
+        const loop = () => {
+          analyser.getFloatTimeDomainData(buf)
+          let sum = 0
+          for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i]
+          const rms = Math.sqrt(sum / buf.length)
+          // Perceptual-ish scaling so quiet speech still registers.
+          setLevel(Math.min(1, rms * 4))
+          raf = requestAnimationFrame(loop)
+        }
+        raf = requestAnimationFrame(loop)
+      } catch {
+        // Meter is best-effort; mic errors surface via the selector UI.
+      }
     }
-    raf = requestAnimationFrame(loop)
-    return () => cancelAnimationFrame(raf)
-  }, [active])
+    start()
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(raf)
+      if (stream) stream.getTracks().forEach((t) => t.stop())
+      if (ac) ac.close().catch(() => {})
+    }
+  }, [active, deviceId])
+
   const bars = 18
-  const t = tick * 0.04
+  const lit = Math.round(level * bars)
   return (
     <div className="vu">
       {Array.from({ length: bars }).map((_, i) => {
-        const h = 10 + Math.abs(Math.sin(i * 0.7 + t) * 60)
+        const on = i < lit
         const color = i < 12 ? 'var(--acc)' : i < 15 ? 'var(--warn)' : 'var(--err)'
         return (
           <span
             key={i}
             className="vu-bar"
-            style={{ height: `${h}%`, background: color }}
+            style={{
+              height: on ? '85%' : '25%',
+              background: on ? color : 'var(--bg-4)',
+              transition: 'height 60ms linear, background 60ms linear'
+            }}
           />
         )
       })}
+    </div>
+  )
+}
+
+// Live camera preview — replaces the old static placeholder card.
+function CameraLivePreview({ deviceId }) {
+  const videoRef = React.useRef(null)
+  const [error, setError] = React.useState(null)
+  React.useEffect(() => {
+    let cancelled = false
+    let stream = null
+    async function start() {
+      setError(null)
+      try {
+        const constraint =
+          deviceId && deviceId !== 'default' ? { deviceId: { exact: deviceId } } : true
+        stream = await navigator.mediaDevices.getUserMedia({ video: constraint, audio: false })
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop())
+          return
+        }
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream
+          videoRef.current.play().catch(() => {})
+        }
+      } catch (err) {
+        if (!cancelled) setError(err.message || 'Camera unavailable')
+      }
+    }
+    start()
+    return () => {
+      cancelled = true
+      if (stream) stream.getTracks().forEach((t) => t.stop())
+    }
+  }, [deviceId])
+  return (
+    <div className="cam-preview" style={{ overflow: 'hidden' }}>
+      {error ? (
+        <div className="cam-label">{error}</div>
+      ) : (
+        <video
+          ref={videoRef}
+          muted
+          playsInline
+          style={{ width: '100%', height: '100%', objectFit: 'cover', transform: 'scaleX(-1)' }}
+        />
+      )}
     </div>
   )
 }

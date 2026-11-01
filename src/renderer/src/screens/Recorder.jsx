@@ -10,12 +10,16 @@ export default function Recorder() {
   const cameraDeviceId = useSession((s) => s.cameraDeviceId)
   const goto = useSession((s) => s.goto)
   const setSession = useSession((s) => s.setSession)
+  const setRecordingActive = useSession((s) => s.setRecordingActive)
 
   const videoRef = useRef(null)
   const recorderRef = useRef(null)
   const previewStreamRef = useRef(null)
   const webcamRecorderRef = useRef(null)
   const webcamStreamRef = useRef(null)
+  // Serialized webcam chunk writes — awaited before finalizing the native
+  // session so no trailing chunk races the writer close.
+  const webcamWritesRef = useRef(Promise.resolve())
 
   const [phase, setPhase] = useState('idle') // idle | countdown | recording | stopping
   const [elapsedMs, setElapsedMs] = useState(0)
@@ -95,14 +99,48 @@ export default function Recorder() {
     return () => clearInterval(elapsedTimerRef.current)
   }, [phase])
 
+  // Lock the Stepper while a capture is in flight, and always release the
+  // lock on unmount so a stray state can't freeze navigation forever.
+  useEffect(() => {
+    setRecordingActive(phase === 'countdown' || phase === 'recording' || phase === 'stopping')
+  }, [phase, setRecordingActive])
+  useEffect(() => () => setRecordingActive(false), [setRecordingActive])
+
+  // Global ⇧⌘R (registered in main). Start when idle, stop when recording —
+  // this is the only control that works while the window is minimized
+  // during capture. Read phase via ref so the listener never goes stale.
+  const phaseRef = useRef(phase)
+  phaseRef.current = phase
+  useEffect(() => {
+    const off = window.electronAPI.onHotkeyToggleRecord?.(() => {
+      if (phaseRef.current === 'idle') beginCountdown()
+      else if (phaseRef.current === 'recording') stopRecording()
+      else if (phaseRef.current === 'countdown') cancelCountdown()
+    })
+    return () => off && off()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const countdownCancelledRef = useRef(false)
+
   async function beginCountdown() {
+    countdownCancelledRef.current = false
     setPhase('countdown')
     setCountdown(3)
     for (let i = 3; i >= 1; i--) {
+      if (countdownCancelledRef.current) return
       setCountdown(i)
       await new Promise((r) => setTimeout(r, 800))
     }
+    // The Cancel button flips this ref — without the check the recording
+    // would still start once the loop finished.
+    if (countdownCancelledRef.current) return
     await startRecording()
+  }
+
+  function cancelCountdown() {
+    countdownCancelledRef.current = true
+    setPhase('idle')
   }
 
   async function startRecording() {
@@ -113,10 +151,30 @@ export default function Recorder() {
       const screenH = screenInfo.height * (screenInfo.scaleFactor || 1)
 
       // Native ScreenCaptureKit path. Drives the helper from main, no
-      // MediaRecorder, no chunk IPC. Falls through to MediaRecorder on any
-      // failure so a flaky helper never blocks recording.
+      // MediaRecorder for the screen — but the webcam (if enabled) still
+      // records via MediaRecorder into a side-car webm. Falls through to
+      // MediaRecorder on any failure so a flaky helper never blocks recording.
       if (isNativeMode) {
         try {
+          // Acquire the webcam BEFORE starting the native capture so a
+          // permission prompt doesn't eat the first seconds of recording.
+          let nativeWebcamStream = null
+          if (cameraEnabled) {
+            try {
+              const camConstraint =
+                cameraDeviceId && cameraDeviceId !== 'default'
+                  ? { deviceId: { exact: cameraDeviceId } }
+                  : true
+              nativeWebcamStream = await navigator.mediaDevices.getUserMedia({
+                video: camConstraint,
+                audio: false
+              })
+            } catch (err) {
+              console.warn('webcam failed', err)
+              setError(`Camera failed: ${err.message || err}`)
+            }
+          }
+
           const displayId = parseInt(source.display_id, 10) || 0
           const init = await window.electronAPI.startNativeRecording({
             displayId,
@@ -126,14 +184,37 @@ export default function Recorder() {
             fps: 60,
             showCursor: true,
             captureMic: !!micEnabled,
-            captureSystemAudio: !!systemAudioEnabled
+            captureSystemAudio: !!systemAudioEnabled,
+            withCamera: !!nativeWebcamStream
           })
           if (!init || init.ok === false) {
+            if (nativeWebcamStream) nativeWebcamStream.getTracks().forEach((t) => t.stop())
             throw new Error(init?.error || 'native start failed')
           }
           usingNativeRef.current = true
           setHookAvailable(init.mouseTrackerAvailable)
           startedAtRef.current = init.recordStart
+
+          if (nativeWebcamStream) {
+            webcamStreamRef.current = nativeWebcamStream
+            const mime = pickWebmMimeType()
+            const camRecorder = new MediaRecorder(nativeWebcamStream, {
+              mimeType: mime,
+              videoBitsPerSecond: 2_000_000
+            })
+            webcamWritesRef.current = Promise.resolve()
+            camRecorder.ondataavailable = (e) => {
+              if (!e.data || e.data.size === 0) return
+              webcamWritesRef.current = webcamWritesRef.current
+                .then(async () => {
+                  const buf = await e.data.arrayBuffer()
+                  await window.electronAPI.writeWebcamChunk(buf)
+                })
+                .catch((err) => console.error('writeWebcamChunk failed', err))
+            }
+            camRecorder.start(250)
+            webcamRecorderRef.current = camRecorder
+          }
           // Stop the preview stream — ScreenCaptureKit owns the display now.
           if (previewStreamRef.current) {
             previewStreamRef.current.getTracks().forEach((t) => t.stop())
@@ -218,18 +299,7 @@ export default function Recorder() {
       setHookAvailable(init.mouseTrackerAvailable)
       startedAtRef.current = init.recordStart
 
-      const mimeCandidates = [
-        'video/webm;codecs=vp9,opus',
-        'video/webm;codecs=vp8,opus',
-        'video/webm'
-      ]
-      let mimeType = ''
-      for (const m of mimeCandidates) {
-        if (MediaRecorder.isTypeSupported(m)) {
-          mimeType = m
-          break
-        }
-      }
+      const mimeType = pickWebmMimeType()
 
       const recorder = new MediaRecorder(combined, {
         mimeType,
@@ -288,9 +358,28 @@ export default function Recorder() {
     }
   }
 
+  // Cleanly finish the webcam side-car: stop the recorder, wait for the
+  // final chunk to flush over IPC, then release the device.
+  async function stopWebcamCapture() {
+    const rec = webcamRecorderRef.current
+    if (rec && rec.state !== 'inactive') {
+      await new Promise((resolve) => {
+        rec.onstop = resolve
+        try { rec.stop() } catch { resolve() }
+      })
+    }
+    webcamRecorderRef.current = null
+    await webcamWritesRef.current.catch(() => {})
+    if (webcamStreamRef.current) {
+      webcamStreamRef.current.getTracks().forEach((t) => t.stop())
+      webcamStreamRef.current = null
+    }
+  }
+
   async function stopRecording() {
     if (usingNativeRef.current) {
       setPhase('stopping')
+      await stopWebcamCapture()
       const result = await window.electronAPI.stopNativeRecording()
       usingNativeRef.current = false
       if (result?.ok) {
@@ -326,6 +415,7 @@ export default function Recorder() {
 
   async function cancelRecording() {
     if (usingNativeRef.current) {
+      await stopWebcamCapture()
       await window.electronAPI.cancelNativeRecording()
       usingNativeRef.current = false
       setPhase('idle')
@@ -501,7 +591,7 @@ export default function Recorder() {
             </>
           )}
           {phase === 'countdown' && (
-            <button className="btn btn-ghost" onClick={() => setPhase('idle')}>
+            <button className="btn btn-ghost" onClick={cancelCountdown}>
               Cancel countdown
             </button>
           )}
@@ -557,6 +647,18 @@ export default function Recorder() {
       )}
     </div>
   )
+}
+
+function pickWebmMimeType() {
+  const candidates = [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm'
+  ]
+  for (const m of candidates) {
+    if (MediaRecorder.isTypeSupported(m)) return m
+  }
+  return ''
 }
 
 function formatTime(ms) {

@@ -4,6 +4,7 @@ import { findBackground, aspectRatioOf } from '../lib/backgrounds.js'
 import {
   rasterizeCursor,
   rasterizeRoundedMask,
+  rasterizeFrameShadow,
   rasterizeAnnotation,
   rasterizeClickEffect
 } from '../lib/rasterize.js'
@@ -59,6 +60,18 @@ export default function Export() {
     setPhase('running')
     setProgress(0)
     setLogTail('')
+    try {
+      await runExport()
+    } catch (err) {
+      // Without this, a throw anywhere in asset prep (rasterize, temp-asset
+      // IPC) left the screen stuck on the "running" spinner forever.
+      console.error('export failed', err)
+      setExportResult({ error: err?.message || String(err) })
+      setPhase('error')
+    }
+  }
+
+  async function runExport() {
     const bg = findBackground(exportSettings.backgroundValue)
     const preset = QUALITY_PRESETS.find((p) => p.key === qualityKey)
 
@@ -76,49 +89,79 @@ export default function Export() {
     } catch (err) {
       console.warn('cursor rasterize failed', err)
     }
-    if (exportSettings.roundness > 0) {
-      try {
-        // Mirror the processor's canvas/inset math so the mask we rasterize
-        // matches the actual inner-clip rectangle pixel-for-pixel. Using a
-        // canonical 1920-wide canvas as the reference; processor scales it
-        // down to whatever inner size the export ends up with — proportional
-        // scale leaves the radius/short-side ratio intact.
-        const sourceAspect =
-          session.screenW && session.screenH
-            ? session.screenW / session.screenH
-            : 16 / 9
-        const targetAspect = aspectRatioOf(exportSettings.canvasAspect, sourceAspect)
-        const canvasW = 1920
-        const canvasH = Math.round(canvasW / targetAspect)
-        const padPx =
-          (Math.min(canvasW, canvasH) * (exportSettings.padding || 0)) / 100
-        const availW = canvasW - 2 * padPx
-        const availH = canvasH - 2 * padPx
-        let innerW, innerH
-        if (availW / availH > sourceAspect) {
-          innerH = availH
-          innerW = innerH * sourceAspect
-        } else {
-          innerW = availW
-          innerH = innerW / sourceAspect
+    // Frame geometry on a canonical 1920-wide reference canvas — mirrors the
+    // processor's framing math so masks/shadows scale proportionally onto
+    // whatever inner size the export ends up with.
+    let frameShadowPngPath = null
+    let frameShadowPad = 0
+    let frameShadowRefW = 0
+    {
+      const srcAspect =
+        session.screenW && session.screenH
+          ? session.screenW / session.screenH
+          : 16 / 9
+      const tgtAspect = aspectRatioOf(exportSettings.canvasAspect, srcAspect)
+      const canvasW = 1920
+      const canvasH = Math.round(canvasW / tgtAspect)
+      const padPx =
+        (Math.min(canvasW, canvasH) * (exportSettings.padding || 0)) / 100
+      const availW = canvasW - 2 * padPx
+      const availH = canvasH - 2 * padPx
+      let innerW, innerH
+      if (availW / availH > srcAspect) {
+        innerH = availH
+        innerW = innerH * srcAspect
+      } else {
+        innerW = availW
+        innerH = innerW / srcAspect
+      }
+      innerW = Math.round(innerW)
+      innerH = Math.round(innerH)
+      const insetShort = Math.min(innerW, innerH)
+      const baseR = Math.max(
+        0,
+        Math.min(insetShort / 2, Math.round((exportSettings.roundness / 100) * insetShort))
+      )
+
+      if (exportSettings.roundness > 0) {
+        try {
+          const maskBuf = await rasterizeRoundedMask(innerW, innerH, baseR)
+          const m = await window.electronAPI.saveTempAsset(
+            `mask-rounded-${innerW}x${innerH}-${baseR}-${Date.now()}.png`,
+            maskBuf
+          )
+          roundedMaskPngPath = m.path
+          roundedMaskW = innerW
+          roundedMaskH = innerH
+        } catch (err) {
+          console.warn('rounded mask rasterize failed', err)
         }
-        innerW = Math.round(innerW)
-        innerH = Math.round(innerH)
-        const insetShort = Math.min(innerW, innerH)
-        const baseR = Math.max(
-          0,
-          Math.min(insetShort / 2, Math.round((exportSettings.roundness / 100) * insetShort))
-        )
-        const maskBuf = await rasterizeRoundedMask(innerW, innerH, baseR)
-        const m = await window.electronAPI.saveTempAsset(
-          `mask-rounded-${innerW}x${innerH}-${baseR}-${Date.now()}.png`,
-          maskBuf
-        )
-        roundedMaskPngPath = m.path
-        roundedMaskW = innerW
-        roundedMaskH = innerH
-      } catch (err) {
-        console.warn('rounded mask rasterize failed', err)
+      }
+
+      // Drop shadow under the framed clip — matches the preview's
+      // box-shadow(0, amt/6, amt, rgba(0,0,0,min(0.6, amt/200))), scaled up
+      // ~2× because the reference canvas is ~2× the on-screen preview.
+      if ((exportSettings.shadow || 0) > 0) {
+        try {
+          const amt = exportSettings.shadow
+          const sh = await rasterizeFrameShadow(
+            innerW,
+            innerH,
+            baseR,
+            amt * 2,
+            Math.round(amt / 3),
+            Math.min(0.6, amt / 200)
+          )
+          const saved = await window.electronAPI.saveTempAsset(
+            `frame-shadow-${innerW}x${innerH}-${Date.now()}.png`,
+            sh.buffer
+          )
+          frameShadowPngPath = saved.path
+          frameShadowPad = sh.pad
+          frameShadowRefW = innerW
+        } catch (err) {
+          console.warn('frame shadow rasterize failed', err)
+        }
       }
     }
 
@@ -216,14 +259,15 @@ export default function Export() {
             `click-${exportSettings.clickEffect}-${Date.now()}.png`,
             eff.buffer
           )
-          // Normalize click positions to [0..1] using the session's
-          // screen size so processor.js doesn't need source dims.
+          // Normalize click positions to [0..1] using each event's own
+          // screen size (logical points — the space uiohook reports in).
+          // session.screenW is physical pixels and mis-scales on Retina.
           const clickPoints = (session.events || [])
             .filter((e) => e.type === 'click')
             .map((e) => ({
               t: e.timestamp,
-              x: session.screenW ? e.x / session.screenW : 0.5,
-              y: session.screenH ? e.y / session.screenH : 0.5
+              x: e.screenW > 0 ? e.x / e.screenW : 0.5,
+              y: e.screenH > 0 ? e.y / e.screenH : 0.5
             }))
           clickEffectsForExport = {
             kind: exportSettings.clickEffect,
@@ -252,8 +296,16 @@ export default function Export() {
       roundedMaskPngPath,
       roundedMaskW,
       roundedMaskH,
+      frameShadowPngPath,
+      frameShadowPad,
+      frameShadowRefW,
       annotations: annotationsForExport,
       clickEffects: clickEffectsForExport,
+      // Raw click timestamps for the optional click sound (independent of
+      // whether a visual click effect is selected).
+      clickTimesMs: (session.events || [])
+        .filter((e) => e.type === 'click')
+        .map((e) => e.timestamp),
       zooms,
       trim
     }

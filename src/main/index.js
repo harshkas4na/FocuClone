@@ -1,4 +1,4 @@
-import { app, BrowserWindow, systemPreferences, dialog, screen } from 'electron'
+import { app, BrowserWindow, systemPreferences, dialog, screen, globalShortcut } from 'electron'
 import { join } from 'path'
 import { fileURLToPath } from 'url'
 import { dirname } from 'path'
@@ -60,9 +60,22 @@ app.whenReady().then(async () => {
   createWindow()
   checkScreenRecordingPermission()
 
+  // ⇧⌘R toggles recording globally — essential once the window minimizes
+  // during capture. The Recorder screen decides what "toggle" means.
+  const ok = globalShortcut.register('Shift+CommandOrControl+R', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('hotkey-toggle-record')
+    }
+  })
+  if (!ok) console.warn('[main] failed to register Shift+Cmd+R global shortcut')
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
+})
+
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll()
 })
 
 app.on('window-all-closed', () => {

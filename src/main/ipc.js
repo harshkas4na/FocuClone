@@ -6,7 +6,10 @@ import {
   appendChunk,
   appendWebcamChunk,
   finalizeSession,
-  discardSession
+  discardSession,
+  startStandaloneWebcam,
+  finalizeStandaloneWebcam,
+  discardStandaloneWebcam
 } from './fileWriter.js'
 import {
   startTracking,
@@ -27,6 +30,20 @@ let recordStartMs = 0
 let activeScreenSize = { w: 1920, h: 1080 }
 
 export function registerIpcHandlers(getWindow) {
+  // Hide the app while capturing so the recorder UI doesn't end up in the
+  // recording (FocuSee does the same). Restored on stop/cancel.
+  function minimizeWindow() {
+    const win = getWindow()
+    if (win && !win.isDestroyed() && !win.isMinimized()) win.minimize()
+  }
+  function restoreWindow() {
+    const win = getWindow()
+    if (win && !win.isDestroyed()) {
+      if (win.isMinimized()) win.restore()
+      win.show()
+      win.focus()
+    }
+  }
   ipcMain.handle('get-sources', async () => {
     const sources = await desktopCapturer.getSources({
       types: ['screen', 'window'],
@@ -52,11 +69,23 @@ export function registerIpcHandlers(getWindow) {
     }
   })
 
+  // uiohook reports mouse coordinates in LOGICAL points (macOS CGEvent
+  // space), while activeScreenSize is the physical pixel size used for
+  // video capture. Normalizing clicks against physical size halved every
+  // coordinate on Retina displays and sent auto-zooms to the wrong spot —
+  // always track against the logical display size.
+  function logicalScreenSize() {
+    const d = screen.getPrimaryDisplay()
+    return { w: d.size.width, h: d.size.height }
+  }
+
   ipcMain.handle('start-recording', async (_e, { sourceId, screenSize, withCamera }) => {
     activeScreenSize = screenSize || activeScreenSize
     const session = await startNewSession({ withCamera: !!withCamera })
     recordStartMs = Date.now()
-    startTracking(recordStartMs, activeScreenSize.w, activeScreenSize.h)
+    const logical = logicalScreenSize()
+    startTracking(recordStartMs, logical.w, logical.h)
+    minimizeWindow()
     return {
       sessionId: session.id,
       videoPath: session.videoPath,
@@ -75,6 +104,7 @@ export function registerIpcHandlers(getWindow) {
   })
 
   ipcMain.handle('stop-recording', async () => {
+    restoreWindow()
     const events = stopTracking()
     const stopAt = Date.now()
     const duration = stopAt - recordStartMs
@@ -89,6 +119,7 @@ export function registerIpcHandlers(getWindow) {
   })
 
   ipcMain.handle('cancel-recording', async () => {
+    restoreWindow()
     stopTracking()
     await discardSession()
     return { ok: true }
@@ -164,11 +195,21 @@ export function registerIpcHandlers(getWindow) {
         (evt) => send('native-recorder-event', evt)
       )
       recordStartMs = Date.now()
-      startTracking(recordStartMs, activeScreenSize.w, activeScreenSize.h)
-      nativeSessionMeta = { outputPath, started, recordStart: recordStartMs }
+      const logical = logicalScreenSize()
+      startTracking(recordStartMs, logical.w, logical.h)
+      // Webcam runs as a renderer MediaRecorder even in native mode — the
+      // helper only captures the display. Chunks land via write-webcam-chunk.
+      let webcamPath = null
+      if (opts.withCamera) {
+        webcamPath = join(dir, `focuclone-${Date.now()}-webcam.webm`)
+        await startStandaloneWebcam(webcamPath)
+      }
+      nativeSessionMeta = { outputPath, started, recordStart: recordStartMs, webcamPath }
+      minimizeWindow()
       return {
         ok: true,
         outputPath,
+        webcamPath,
         recordStart: recordStartMs,
         mouseTrackerAvailable: mouseTrackerAvailable(),
         ...started
@@ -179,10 +220,16 @@ export function registerIpcHandlers(getWindow) {
   })
 
   ipcMain.handle('stop-native-recording', async () => {
+    restoreWindow()
     if (!nativeSessionMeta) return { ok: false, error: 'no active native recording' }
     const events = stopTracking()
     const stopAt = Date.now()
     const duration = stopAt - nativeSessionMeta.recordStart
+    const webcam = await finalizeStandaloneWebcam()
+    if (!webcam && nativeSessionMeta.webcamPath) {
+      // Writer got no bytes — remove the empty file.
+      try { await fsp.unlink(nativeSessionMeta.webcamPath) } catch {}
+    }
     const result = await stopNative()
     if (!result || result.event !== 'stopped') {
       const meta = nativeSessionMeta
@@ -200,7 +247,7 @@ export function registerIpcHandlers(getWindow) {
     const sessionJson = {
       id: sessionId,
       videoPath: result.outputPath,
-      webcamPath: null,
+      webcamPath: webcam ? webcam.path : null,
       recordStart: nativeSessionMeta.recordStart,
       duration,
       screenW: activeScreenSize.w,
@@ -217,7 +264,9 @@ export function registerIpcHandlers(getWindow) {
   })
 
   ipcMain.handle('cancel-native-recording', async () => {
+    restoreWindow()
     if (nativeSessionMeta) stopTracking()
+    await discardStandaloneWebcam()
     await cancelNative()
     if (nativeSessionMeta) {
       try { await fsp.unlink(nativeSessionMeta.outputPath) } catch {}

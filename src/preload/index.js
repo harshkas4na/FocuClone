@@ -23,6 +23,12 @@ const api = {
     return () => ipcRenderer.removeListener('native-recorder-event', listener)
   },
 
+  onHotkeyToggleRecord: (cb) => {
+    const listener = () => cb()
+    ipcRenderer.on('hotkey-toggle-record', listener)
+    return () => ipcRenderer.removeListener('hotkey-toggle-record', listener)
+  },
+
   saveTempAsset: (name, buffer) =>
     ipcRenderer.invoke('save-temp-asset', { name, buffer }),
   processVideo: (session, opts) => ipcRenderer.invoke('process-video', { session, opts }),

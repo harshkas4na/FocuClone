@@ -17,6 +17,8 @@ export default function Timeline({
   zooms = [],
   selectedZoomId,
   clicks = [],
+  annotations = [],
+  selectedAnnotationId,
   trim = { inMs: 0, outMs: null },
   videoSrc,
   onSeek,
@@ -24,6 +26,9 @@ export default function Timeline({
   onMoveZoom,
   onResizeZoom,
   onDeleteZoom,
+  onSelectAnnotation,
+  onMoveAnnotation,
+  onDeleteAnnotation,
   onTrimChange
 }) {
   const wrapRef = useRef(null)
@@ -71,9 +76,11 @@ export default function Timeline({
       payload,
       startMs: pxToMs(e.clientX),
       origZoom: payload?.zoom,
+      origAnn: payload?.ann,
       origTrim: { inMs: trimIn, outMs: trimOut }
     }
     if (payload?.zoom) onSelectZoom?.(payload.zoom.id)
+    if (payload?.ann) onSelectAnnotation?.(payload.ann.id)
     document.addEventListener('mousemove', onDragMove)
     document.addEventListener('mouseup', onDragEnd)
   }
@@ -123,6 +130,13 @@ export default function Timeline({
       let newEnd = Math.min(dur, Math.max(z.peakEnd + 100, z.end + dMs))
       newEnd = snapMs(newEnd, z.id)
       onResizeZoom?.(z.id, { end: newEnd, peakEnd: newEnd - easeOut })
+    } else if (d.kind === 'ann-move' && d.origAnn) {
+      const a = d.origAnn
+      const len = a.end - a.start
+      let start = Math.max(0, a.start + dMs)
+      if (start + len > dur) start = Math.max(0, dur - len)
+      start = snapMs(start)
+      onMoveAnnotation?.(a.id, start)
     } else if (d.kind === 'trim-in') {
       let newIn = Math.max(0, Math.min(d.origTrim.outMs - 200, d.origTrim.inMs + dMs))
       newIn = snapMs(newIn)
@@ -309,11 +323,37 @@ export default function Timeline({
             })}
           </div>
 
-          {/* Annotations track (decorative until annotation editing UI lands) */}
+          {/* Annotations track */}
           <div className="tl-row tl-row-anno">
             <div className="tl-row-label">
               <span className="dot" style={{ background: '#5E6AD2' }} />Annotations
             </div>
+            {annotations.map((a) => {
+              const left = msToPx(a.start)
+              const width = Math.max(16, msToPx(a.end) - left)
+              const sel = a.id === selectedAnnotationId
+              const label =
+                a.kind === 'text'
+                  ? (a.text || 'Text')
+                  : a.kind === 'shape'
+                    ? (a.shapeId || 'Shape')
+                    : (a.maskId || 'Mask')
+              return (
+                <div
+                  key={a.id}
+                  className={`tl-anno ${sel ? 'sel' : ''}`}
+                  style={{ left, width, cursor: 'grab' }}
+                  onMouseDown={(e) => startDrag('ann-move', { ann: a }, e)}
+                  onDoubleClick={(e) => {
+                    e.stopPropagation()
+                    onDeleteAnnotation?.(a.id)
+                  }}
+                  title={`${label} · ${formatTime(a.start)}–${formatTime(a.end)} (double-click to delete)`}
+                >
+                  {label}
+                </div>
+              )
+            })}
           </div>
 
           {/* Audio waveform */}

@@ -34,6 +34,28 @@ import {
   SHAPE_DEFS as SHAPE_DEFS_DATA
 } from '../lib/annotations.js'
 
+// Shared AudioContext for the preview's click sound. Matches the export's
+// synthesized click (1400 Hz burst, ~40 ms decay) so what you hear in the
+// editor is what lands in the MP4.
+let clickAudioCtx = null
+function playClickSound() {
+  try {
+    clickAudioCtx = clickAudioCtx || new (window.AudioContext || window.webkitAudioContext)()
+    const t = clickAudioCtx.currentTime
+    const osc = clickAudioCtx.createOscillator()
+    const gain = clickAudioCtx.createGain()
+    osc.frequency.value = 1400
+    gain.gain.setValueAtTime(0.25, t)
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.04)
+    osc.connect(gain)
+    gain.connect(clickAudioCtx.destination)
+    osc.start(t)
+    osc.stop(t + 0.05)
+  } catch {
+    // Best-effort — no sound is not fatal.
+  }
+}
+
 const PANELS = [
   { id: 'background', label: 'Background', icon: 'bg' },
   { id: 'cursor', label: 'Cursor', icon: 'cursor' },
@@ -101,6 +123,9 @@ export default function Editor() {
   const wrapperRef = useRef(null)
   const innerRef = useRef(null)
   const cursorOverlayRef = useRef(null)
+  // Click pulses live in source-normalized coords; mirroring the video's
+  // zoom transform onto their layer keeps them pinned to the clicked pixel.
+  const pulseLayerRef = useRef(null)
   const rafRef = useRef(0)
   const currentMsRef = useRef(0)
   const lastClickIdxRef = useRef(-1)
@@ -139,6 +164,7 @@ export default function Editor() {
   const [previewEnabled, setPreviewEnabled] = useState(true)
   const [isPlaying, setIsPlaying] = useState(false)
   const [centerPicking, setCenterPicking] = useState(false)
+  const [showDiscardModal, setShowDiscardModal] = useState(false)
   const [pendingAnnotation, setPendingAnnotation] = useState(null) // { kind, ...spec }
   const [clickPulses, setClickPulses] = useState([]) // {id, xPct, yPct, kind, born}
 
@@ -152,8 +178,12 @@ export default function Editor() {
       goto('home')
       return
     }
+    // Only derive zooms once per session. The Editor unmounts when the user
+    // visits Export; without this guard, coming back re-ran the derivation
+    // and threw away every manual zoom edit.
+    if (useSession.getState().zoomsSessionId === session.id) return
     const initial = zoomsFromEvents(session.events || [], exportSettings)
-    setZooms(initial)
+    setZooms(initial, session.id)
     // We deliberately depend on session.id, not the whole session object —
     // re-running on every settings tweak would clobber user edits.
   }, [session?.id])
@@ -242,6 +272,11 @@ export default function Editor() {
 
         v.style.transformOrigin = `${(cx * 100).toFixed(2)}% ${(cy * 100).toFixed(2)}%`
         v.style.transform = `scale(${zoom.toFixed(3)})`
+        const pl = pulseLayerRef.current
+        if (pl) {
+          pl.style.transformOrigin = v.style.transformOrigin
+          pl.style.transform = v.style.transform
+        }
 
         if (curEl) {
           const inZoom = activeZoomAt(zs, tMs) != null
@@ -273,22 +308,30 @@ export default function Editor() {
         }
       } else {
         v.style.transform = 'none'
+        if (pulseLayerRef.current) pulseLayerRef.current.style.transform = 'none'
         if (curEl) curEl.style.opacity = '0'
         resetSpring(zoomSpringRef.current, 1)
         resetSpring(cxSpringRef.current, 0.5)
         resetSpring(cySpringRef.current, 0.5)
       }
 
-      // Spawn click-effect pulses when the playhead crosses click events.
-      if (es.clickEffect !== 'none' && cls.length) {
+      // Spawn click-effect pulses / click sounds when the playhead crosses
+      // click events. Sound is independent of the visual effect choice.
+      if ((es.clickEffect !== 'none' || es.cursorClickSound) && cls.length) {
         const lastIdx = lastClickIdxRef.current
         for (let i = 0; i < cls.length; i++) {
           const cMs = cls[i].timestamp
           if (cMs <= tMs && cMs > tMs - 80 && i !== lastIdx) {
             lastClickIdxRef.current = i
-            const xNorm = cls[i].x / (s.screenW || 1)
-            const yNorm = cls[i].y / (s.screenH || 1)
-            spawnClickPulse(xNorm, yNorm, es.clickEffect, tMs)
+            if (es.clickEffect !== 'none') {
+              // Events carry their own screen size (logical points — the
+              // space uiohook reports in). session.screenW is physical pixels
+              // and would halve the position on Retina.
+              const xNorm = cls[i].screenW > 0 ? cls[i].x / cls[i].screenW : 0.5
+              const yNorm = cls[i].screenH > 0 ? cls[i].y / cls[i].screenH : 0.5
+              spawnClickPulse(xNorm, yNorm, es.clickEffect, tMs)
+            }
+            if (es.cursorClickSound && playing) playClickSound()
             break
           }
         }
@@ -702,6 +745,7 @@ export default function Editor() {
           >
             <FramedCanvas
               aspect={canvasAspect}
+              sourceAspect={sourceAspect}
               bgCss={bg.css}
               padPct={padPct}
               insetPct={insetPct}
@@ -746,8 +790,8 @@ export default function Editor() {
                 <CursorSvg style={cursorStyle} />
               </div>
 
-              {/* Click-effect pulses */}
-              <ClickPulseLayer pulses={clickPulses} />
+              {/* Click-effect pulses (layer mirrors the video's zoom transform) */}
+              <ClickPulseLayer pulses={clickPulses} layerRef={pulseLayerRef} />
 
               {/* Annotations */}
               <AnnotationsLayer
@@ -847,6 +891,8 @@ export default function Editor() {
                 zooms={zooms}
                 selectedZoomId={selectedZoomId}
                 clicks={clicks}
+                annotations={annotations}
+                selectedAnnotationId={selectedAnnotationId}
                 videoSrc={videoSrc}
                 trim={trim}
                 onSeek={seek}
@@ -854,6 +900,18 @@ export default function Editor() {
                 onMoveZoom={moveSelectedZoom}
                 onResizeZoom={resizeSelectedZoom}
                 onDeleteZoom={removeZoom}
+                onSelectAnnotation={(id) => {
+                  selectAnnotation(id)
+                  // Surface the annotation panel so the selection is editable.
+                  if (id) setActivePanel('annotations')
+                }}
+                onMoveAnnotation={(id, newStart) => {
+                  const a = annotations.find((x) => x.id === id)
+                  if (!a) return
+                  const len = a.end - a.start
+                  updateAnnotation(id, { start: newStart, end: newStart + len })
+                }}
+                onDeleteAnnotation={removeAnnotation}
                 onTrimChange={(patch) => setTrim(patch)}
               />
             </div>
@@ -936,7 +994,11 @@ export default function Editor() {
           ) : activePanel === 'cursor' ? (
             <CursorPanel settings={exportSettings} update={updateExportSettings} />
           ) : activePanel === 'camera' ? (
-            <CameraPanel settings={exportSettings} update={updateExportSettings} />
+            <CameraPanel
+              settings={exportSettings}
+              update={updateExportSettings}
+              hasWebcam={!!session.webcamPath}
+            />
           ) : activePanel === 'audio' ? (
             <AudioPanel settings={exportSettings} update={updateExportSettings} />
           ) : activePanel === 'keyboard' ? (
@@ -965,7 +1027,7 @@ export default function Editor() {
               updateExportSettings={updateExportSettings}
               onResetZooms={() => {
                 const initial = zoomsFromEvents(events, exportSettings)
-                setZooms(initial)
+                setZooms(initial, session.id)
               }}
             />
           )}
@@ -973,7 +1035,7 @@ export default function Editor() {
         <div className="p-4 border-t border-panel2 bg-panel">
           <div className="flex gap-2">
             <button
-              onClick={() => { reset(); goto('home') }}
+              onClick={() => setShowDiscardModal(true)}
               className="flex-1 px-4 py-2 rounded-md text-sm border border-panel2 hover:bg-panel2"
             >
               Discard
@@ -987,12 +1049,39 @@ export default function Editor() {
           </div>
         </div>
       </aside>
+
+      {showDiscardModal && (
+        <div className="modal-scrim" onClick={() => setShowDiscardModal(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-icon danger">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+                <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m1 0v14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V6"
+                      stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+              </svg>
+            </div>
+            <div className="modal-title">Discard this project?</div>
+            <p className="modal-body">
+              All zooms, annotations, and trim edits for this recording will be lost.
+              This can't be undone.
+            </p>
+            <div className="modal-actions">
+              <button className="btn btn-ghost" onClick={() => setShowDiscardModal(false)}>
+                Keep editing
+              </button>
+              <button className="btn btn-danger" onClick={() => { reset(); goto('home') }}>
+                Discard
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
 
 function FramedCanvas({
   aspect,
+  sourceAspect,
   bgCss,
   padPct,
   insetPct,
@@ -1038,17 +1127,30 @@ function FramedCanvas({
     return () => ro.disconnect()
   }, [aspect])
 
-  // Convert the roundness % into a uniform pixel radius based on the inset
-  // box's short side. This mirrors the export pipeline exactly so what you
-  // see is what gets rendered into the MP4.
-  const insetSize = (() => {
-    const padFrac = padPct / 100
-    const insetFrac = insetPct / 100
-    const w = Math.max(0, box.w * (1 - 2 * padFrac) * (1 - 2 * insetFrac))
-    const h = Math.max(0, box.h * (1 - 2 * padFrac) * (1 - 2 * insetFrac))
-    return Math.min(w, h)
-  })()
-  const roundnessPxComputed = (roundnessPx / 100) * insetSize
+  // Mirror the export pipeline's pixel math exactly (processor.js framing):
+  //   padPx    = shorter canvas side × padding%
+  //   inner    = source-aspect rect contained in the padded box
+  //   insetPx  = shorter inner side × inset%
+  //   radius   = shorter inner side × roundness%
+  // The old version gave the inner clip the CANVAS aspect, so a non-original
+  // aspect letterboxed the video in black inside the clip while the export
+  // rendered a tight source-aspect clip on the wallpaper — and every
+  // normalized overlay coordinate (cursor, annotations) landed off-target.
+  const padPx = (Math.min(box.w, box.h) * padPct) / 100
+  const availW = Math.max(0, box.w - 2 * padPx)
+  const availH = Math.max(0, box.h - 2 * padPx)
+  const srcA = sourceAspect || aspect
+  let innerW, innerH
+  if (availH <= 0 || availW / availH > srcA) {
+    innerH = availH
+    innerW = availH * srcA
+  } else {
+    innerW = availW
+    innerH = availW / srcA
+  }
+  const innerShort = Math.min(innerW, innerH)
+  const insetPx = (innerShort * insetPct) / 100
+  const radiusPx = Math.min(innerShort / 2, (roundnessPx / 100) * innerShort)
 
   return (
     <div
@@ -1058,7 +1160,7 @@ function FramedCanvas({
     <div
       onClick={onClick}
       onMouseDown={onMouseDown}
-      className={`relative ${cursorClass}`}
+      className={`relative flex items-center justify-center ${cursorClass}`}
       style={{
         width: box.w || '100%',
         height: box.h || '100%',
@@ -1070,38 +1172,27 @@ function FramedCanvas({
         backgroundPosition: 'center'
       }}
     >
-      {/* padding box */}
+      {/* inset (coloured border) box — exactly source aspect */}
       <div
-        className="absolute inset-0 flex items-center justify-center"
-        style={{ padding: `${padPct}%` }}
+        className="relative"
+        style={{
+          width: innerW,
+          height: innerH,
+          background: insetPx > 0 ? insetColor : 'transparent',
+          borderRadius: radiusPx,
+          boxShadow: shadowCss
+        }}
       >
-        {/* inset (coloured border) box */}
+        {/* inner video clip */}
         <div
-          className="relative overflow-hidden"
+          ref={innerRef}
+          className="absolute overflow-hidden bg-black"
           style={{
-            width: '100%',
-            height: '100%',
-            background: insetPct > 0 ? insetColor : 'transparent',
-            padding: `${insetPct}%`,
-            // Roundness is a % of the inset short side. Computing it in px from
-            // the measured box keeps a true-uniform corner (CSS `border-radius:
-            // X%` would yield an ellipse on non-square boxes).
-            borderRadius: roundnessPxComputed,
-            boxShadow: shadowCss
+            inset: insetPx,
+            borderRadius: Math.max(0, radiusPx - insetPx)
           }}
         >
-          {/* inner video clip */}
-          <div
-            ref={innerRef}
-            className="relative overflow-hidden bg-black"
-            style={{
-              width: '100%',
-              height: '100%',
-              borderRadius: Math.max(0, roundnessPxComputed - 1)
-            }}
-          >
-            {children}
-          </div>
+          {children}
         </div>
       </div>
     </div>
@@ -1200,9 +1291,9 @@ function CursorSvg({ style }) {
   )
 }
 
-function ClickPulseLayer({ pulses }) {
+function ClickPulseLayer({ pulses, layerRef }) {
   return (
-    <div className="absolute inset-0 pointer-events-none">
+    <div ref={layerRef} className="absolute inset-0 pointer-events-none" style={{ willChange: 'transform' }}>
       {pulses.map((p) => (
         <ClickPulse key={p.id} pulse={p} />
       ))}
@@ -2025,7 +2116,7 @@ function ColorPicker({ label, value, onChange }) {
   )
 }
 
-function CameraPanel({ settings, update }) {
+function CameraPanel({ settings, update, hasWebcam }) {
   const layouts = [
     { id: 'br', label: '↘' },
     { id: 'bl', label: '↙' },
@@ -2038,7 +2129,7 @@ function CameraPanel({ settings, update }) {
     <>
       <Section title="Webcam">
         <label className="flex items-center justify-between text-sm cursor-pointer">
-          <span>Show camera (preview only)</span>
+          <span>Show camera</span>
           <input
             type="checkbox"
             checked={settings.showCamera}
@@ -2046,10 +2137,12 @@ function CameraPanel({ settings, update }) {
             className="accent-accent"
           />
         </label>
-        <div className="text-[11px] text-amber-300/80 bg-amber-300/5 border border-amber-300/20 rounded p-2">
-          Live preview only — webcam capture during recording isn't wired in
-          yet, so the export won't include this overlay.
-        </div>
+        {!hasWebcam && (
+          <div className="text-[11px] text-amber-300/80 bg-amber-300/5 border border-amber-300/20 rounded p-2">
+            This recording has no webcam track, so the export won't include the
+            overlay. Turn on Camera before recording to capture one.
+          </div>
+        )}
       </Section>
 
       <Section title="Layout">

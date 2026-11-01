@@ -690,6 +690,13 @@ input[type='range']::-webkit-slider-thumb {
   padding: 0 10px;
   font: 500 11px var(--font-ui);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  transition: border-color .12s;
+}
+.tl-anno:hover { border-color: #8B95E8; }
+.tl-anno.sel {
+  background: rgba(94,106,210,0.32);
+  border-color: #8B95E8;
+  box-shadow: 0 0 0 2px rgba(94,106,210,0.3);
 }
 
 .tl-audio-track {

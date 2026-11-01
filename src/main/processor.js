@@ -17,7 +17,8 @@ import {
 import {
   bakeCameraTrajectory,
   buildBakedZoomExpressions,
-  buildCursorSendcmdFromBaked
+  buildCursorSendcmdFromBaked,
+  sampleBakedTrajectory
 } from './cameraBake.js'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -110,6 +111,8 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
     // the legacy `background` enum for older callers.
     bgFfmpeg,
     padding = 5, // % of canvas shorter side
+    inset = 0, // % of inner shorter side — coloured border inside the frame
+    insetColor = '#000000',
     canvasAspectRatio,
     background = 'none',
     watermarkEnabled = false,
@@ -127,6 +130,7 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
     audioFadeOutMs = 0,
     audioMuted = false,
     cursorSize = 1.0,
+    hideCursorWhenIdle = false,
     cursorPngPath = null,
     cursorFollowMode = 'dead-zone',
     cursorFollowSafeZone = 0.6,
@@ -134,9 +138,14 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
     roundedMaskPngPath = null,
     roundedMaskW = 0,
     roundedMaskH = 0,
+    frameShadowPngPath = null,
+    frameShadowPad = 0,
+    frameShadowRefW = 0,
     showKeystrokes = false,
     keystrokePosition = 'bottom',
     keystrokeWindowMs = 1500,
+    cursorClickSound = false,
+    clickTimesMs = [],
     annotations: annotationOverlays = [],
     clickEffects = null
   } = opts
@@ -274,14 +283,16 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
   let cmdsFilePath = null
   if (cursorAvailable) {
     const cursorIdx = nextInputIdx++
-    // Follows-mouse cursor is drawn for the full output (matches the preview).
-    // Fixed cursor is gated to click windows since it has no per-frame
+    // Follows-mouse cursor is drawn for the full output (matches the
+    // preview) — unless "hide cursor when idle" is on, in which case it's
+    // gated to the zoom windows exactly like the editor preview. Fixed
+    // cursor is always gated to click windows since it has no per-frame
     // position and centering it for the whole video would look broken.
-    const enableExpr = cursorFollowsMouse
-      ? '1'
-      : cursorWindows
-          .map((w) => `between(t,${(w.start / 1000).toFixed(3)},${(w.end / 1000).toFixed(3)})`)
-          .join('+')
+    const windowGate = cursorWindows
+      .map((w) => `between(t,${(w.start / 1000).toFixed(3)},${(w.end / 1000).toFixed(3)})`)
+      .join('+')
+    const enableExpr =
+      cursorFollowsMouse && !hideCursorWhenIdle ? '1' : windowGate || '0'
 
     if (cursorFollowsMouse) {
       // Pre-compute per-frame cursor x,y as sendcmd commands. The size slider
@@ -529,7 +540,15 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
         const tStart = Math.max(0, (c.t - trimInMs) / 1000)
         const tEnd = tStart + durSec
         if (tEnd <= 0 || tStart >= outDurSec) continue
-        windows.push({ tStart, tEnd, x: c.x, y: c.y })
+        // The overlay lands on the zoomed stream, so map the source-space
+        // click through the camera at click time: out = (p - c) * z + 0.5.
+        // Without this, pulses drew at the unzoomed position while the
+        // camera was zoomed in — visibly off-target.
+        const cam = sampleBakedTrajectory(cameraKeyframes, tStart * 1000)
+        const z = Math.max(cam.z, 1)
+        const zx = (c.x - cam.cx) * z + 0.5
+        const zy = (c.y - cam.cy) * z + 0.5
+        windows.push({ tStart, tEnd, x: zx, y: zy })
       }
       if (windows.length > 0) {
         // FFmpeg overlay x/y expressions can reference `t`. We compute the
@@ -563,6 +582,166 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
         currentLabel = `[${outLabel}]`
         onLog && onLog(`[processor] click effect "${clickEffects.kind}": ${windows.length} click pulses\n`)
       }
+    }
+  }
+
+  // Webcam PiP — drawn on the INNER stream (pre-framing) so its position
+  // matches the editor preview, which renders the camera inside the inner
+  // clip. Only if the recording captured one and the toggle stayed on.
+  if (showCamera && session.webcamPath) {
+    let webcamAvailable = false
+    try {
+      await fs.access(session.webcamPath)
+      webcamAvailable = true
+    } catch {
+      onLog && onLog(`[processor] webcam.webm missing, skipping camera overlay\n`)
+    }
+    if (webcamAvailable) {
+      extraInputs.push('-i', session.webcamPath)
+      const camIdx = nextInputIdx++
+      const shortSide = Math.min(W, H)
+      const margin = Math.round(shortSide * 0.04)
+      const corner = Math.max(2, Math.round((shortSide * cameraSize) / 100))
+
+      let camW, camH, posX, posY, mask = false
+      if (cameraLayout === 'full') {
+        camW = W; camH = H; posX = 0; posY = 0
+      } else if (cameraLayout === 'bottom-strip') {
+        camH = Math.round(H * 0.22)
+        camW = W
+        posX = 0
+        posY = H - camH
+      } else {
+        // Corner layouts. For circle we render square; for rect we keep 16:9.
+        if (cameraShape === 'circle') {
+          camW = corner; camH = corner; mask = true
+        } else {
+          camW = corner
+          camH = Math.round(corner * 9 / 16)
+        }
+        camW -= camW % 2
+        camH -= camH % 2
+        switch (cameraLayout) {
+          case 'tl': posX = margin; posY = margin; break
+          case 'tr': posX = W - camW - margin; posY = margin; break
+          case 'bl': posX = margin; posY = H - camH - margin; break
+          default:   posX = W - camW - margin; posY = H - camH - margin
+        }
+      }
+
+      // Supersample 2× before masking so the circular alpha edge gets
+      // antialiased by the downscale, then feather ~1.5 px for a soft rim.
+      const flipPart = cameraFlip ? 'hflip,' : ''
+      const SS = 2
+      const ssW = camW * SS
+      const ssH = camH * SS
+      const cropToFit = `scale=${ssW}:${ssH}:force_original_aspect_ratio=increase,crop=${ssW}:${ssH}`
+      let camChain = `[${camIdx}:v]${flipPart}${cropToFit}`
+      if (mask) {
+        const rOuter = ssW / 2
+        const rInner = rOuter - SS * 1.5
+        const ccx = rOuter
+        const ccy = rOuter
+        const feather = rOuter - rInner
+        camChain +=
+          `,format=yuva420p,geq=` +
+          `r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':` +
+          `a='clip(255*((${rOuter}) - sqrt((X-${ccx})*(X-${ccx})+(Y-${ccy})*(Y-${ccy})))/${feather.toFixed(3)}, 0, 255)'`
+      }
+      camChain += `,scale=${camW}:${camH}:flags=lanczos[cam_pp]`
+      filterChain.push(camChain)
+
+      filterChain.push(
+        `${currentLabel}[cam_pp]overlay=x=${posX}:y=${posY}:format=auto[withcam]`
+      )
+      currentLabel = '[withcam]'
+      onLog && onLog(`[processor] camera overlay ${camW}×${camH} at (${posX},${posY}) layout=${cameraLayout}\n`)
+    }
+  }
+
+  // Watermark — applied on the inner stream (before bg framing) so it sits
+  // inside the inner clip exactly like the preview.
+  if (watermarkEnabled && watermarkText) {
+    const safeText = watermarkText
+      .replace(/\\/g, '\\\\')
+      .replace(/:/g, '\\:')
+      .replace(/'/g, "\\'")
+    const margin = Math.round(Math.min(W, H) * 0.04)
+    const xy = (() => {
+      switch (watermarkPosition) {
+        case 'top-left': return `x=${margin}:y=${margin}`
+        case 'top-right': return `x=w-tw-${margin}:y=${margin}`
+        case 'bottom-left': return `x=${margin}:y=h-th-${margin}`
+        default: return `x=w-tw-${margin}:y=h-th-${margin}`
+      }
+    })()
+    // Editor watermark size is in CSS px on a typical ~600-tall inner clip;
+    // scale to actual export height so it stays proportional.
+    const fontSize = Math.max(10, Math.round((watermarkSize / 600) * H))
+    const alpha = Math.max(0, Math.min(1, watermarkOpacity)).toFixed(2)
+    filterChain.push(
+      `${currentLabel}drawtext=text='${safeText}':fontcolor=white@${alpha}:fontsize=${fontSize}:${xy}:shadowcolor=black@0.5:shadowx=1:shadowy=1[wm]`
+    )
+    currentLabel = '[wm]'
+  }
+
+  // Keystroke overlay — also on the inner stream to mirror the preview. One
+  // drawtext per keydown with an `enable` window; simultaneous keys stagger
+  // horizontally via a slot allocator.
+  if (showKeystrokes) {
+    const keys = (session.events || []).filter((e) => e.type === 'key')
+    const trimmed = keys
+      .filter((k) => k.timestamp >= trimInMs && k.timestamp <= trimOutMs)
+      .map((k) => ({ ...k, tSec: (k.timestamp - trimInMs) / 1000 }))
+      .sort((a, b) => a.tSec - b.tSec)
+
+    if (trimmed.length > 0) {
+      const windowS = Math.max(0.1, keystrokeWindowMs / 1000)
+      const slotFreeAt = []
+      const SLOT_W = 90
+      const fontSize = Math.max(20, Math.round(H * 0.04))
+      const yExpr =
+        keystrokePosition === 'top'
+          ? `${Math.round(H * 0.08)}`
+          : `h-th-${Math.round(H * 0.08)}`
+
+      for (let kIdx = 0; kIdx < trimmed.length; kIdx++) {
+        const k = trimmed[kIdx]
+        let slot = 0
+        while (slot < slotFreeAt.length && slotFreeAt[slot] > k.tSec) slot++
+        if (slot >= slotFreeAt.length) slotFreeAt.push(0)
+        slotFreeAt[slot] = k.tSec + windowS
+
+        const half = Math.floor((slot + 1) / 2)
+        const sign = slot === 0 ? 0 : slot % 2 === 1 ? 1 : -1
+        const xOffset = sign * half * SLOT_W
+
+        const parts = []
+        if (k.meta) parts.push('CMD')
+        if (k.ctrl) parts.push('CTRL')
+        if (k.alt) parts.push('ALT')
+        if (k.shift && k.label.length > 1) parts.push('SHIFT')
+        parts.push(k.label.length === 1 ? k.label.toUpperCase() : k.label)
+        const text = parts.join(' ')
+          .replace(/\\/g, '\\\\')
+          .replace(/:/g, '\\:')
+          .replace(/'/g, "\\'")
+
+        const enableExpr = `between(t,${k.tSec.toFixed(3)},${(k.tSec + windowS).toFixed(3)})`
+        const xExpr = xOffset === 0
+          ? `(w-tw)/2`
+          : `(w-tw)/2${xOffset > 0 ? '+' : ''}${xOffset}`
+
+        const kLabel = `k${kIdx}_${slot}_${k.tSec.toFixed(3).replace('.', '_')}`
+        filterChain.push(
+          `${currentLabel}drawtext=text='${text}':fontcolor=white:fontsize=${fontSize}:` +
+            `box=1:boxcolor=black@0.7:boxborderw=10:` +
+            `x='${xExpr}':y='${yExpr}':` +
+            `enable='${enableExpr}'[${kLabel}]`
+        )
+        currentLabel = `[${kLabel}]`
+      }
+      onLog && onLog(`[processor] keystroke overlay: ${trimmed.length} key chips\n`)
     }
   }
 
@@ -645,211 +824,84 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
       }
     }
 
+    // Inner content: scale to the video area; a non-zero inset shrinks the
+    // video and pads it back out with the inset colour, matching the
+    // preview's coloured border. Previously inset was preview-only.
+    const insetPx = Math.max(0, Math.round((Math.min(innerW, innerH) * (inset || 0)) / 100))
+    let contentChain
+    if (insetPx > 0) {
+      let videoW = innerW - 2 * insetPx
+      videoW -= videoW % 2
+      let videoH = innerH - 2 * insetPx
+      videoH -= videoH % 2
+      const padX = Math.round((innerW - videoW) / 2)
+      const padY = Math.round((innerH - videoH) / 2)
+      const colorHex = String(insetColor || '#000000').replace('#', '0x')
+      contentChain = `${currentLabel}scale=${videoW}:${videoH},pad=${innerW}:${innerH}:${padX}:${padY}:color=${colorHex}`
+    } else {
+      contentChain = `${currentLabel}scale=${innerW}:${innerH}`
+    }
+
+    filterChain.push(
+      `[${bgIdx}:v]trim=duration=${(outDurSec + 1).toFixed(2)},setpts=PTS-STARTPTS[bg0]`
+    )
+    let bgLabel = '[bg0]'
+
+    // Drop shadow beneath the clip (renderer-rasterized PNG). Previously the
+    // preview showed a box-shadow the export never rendered.
+    if (frameShadowPngPath) {
+      let shadowAvailable = false
+      try {
+        await fs.access(frameShadowPngPath)
+        shadowAvailable = true
+      } catch {
+        onLog && onLog(`[processor] frame shadow PNG missing, skipping\n`)
+      }
+      if (shadowAvailable) {
+        extraInputs.push('-i', frameShadowPngPath)
+        const shIdx = nextInputIdx++
+        const ratio = frameShadowRefW > 0 ? innerW / frameShadowRefW : 1
+        const scaledPad = Math.round((frameShadowPad || 0) * ratio)
+        const shW = innerW + 2 * scaledPad
+        const shH = innerH + 2 * scaledPad
+        filterChain.push(`[${shIdx}:v]scale=${shW}:${shH}[frShadow]`)
+        filterChain.push(
+          `${bgLabel}[frShadow]overlay=x=${offX - scaledPad}:y=${offY - scaledPad}:format=auto[bgsh]`
+        )
+        bgLabel = '[bgsh]'
+      }
+    }
+
     if (roundedMaskAvailable) {
-      filterChain.push(
-        `${currentLabel}scale=${innerW}:${innerH},format=yuva420p[insetRgba]`
-      )
+      filterChain.push(`${contentChain},format=yuva420p[insetRgba]`)
       filterChain.push(
         `[${roundedMaskIdx}:v]scale=${innerW}:${innerH},format=gray[maskScaled]`
       )
       filterChain.push(`[insetRgba][maskScaled]alphamerge[insetRound]`)
-      filterChain.push(
-        `[${bgIdx}:v]trim=duration=${(outDurSec + 1).toFixed(2)},setpts=PTS-STARTPTS[bg]`
-      )
-      filterChain.push(`[bg][insetRound]overlay=x=${offX}:y=${offY}:format=auto[composed]`)
+      filterChain.push(`${bgLabel}[insetRound]overlay=x=${offX}:y=${offY}:format=auto[composed]`)
     } else {
-      filterChain.push(`${currentLabel}scale=${innerW}:${innerH}[inset]`)
-      filterChain.push(
-        `[${bgIdx}:v]trim=duration=${(outDurSec + 1).toFixed(2)},setpts=PTS-STARTPTS[bg]`
-      )
-      filterChain.push(`[bg][inset]overlay=x=${offX}:y=${offY}:format=auto[composed]`)
+      filterChain.push(`${contentChain}[inset]`)
+      filterChain.push(`${bgLabel}[inset]overlay=x=${offX}:y=${offY}:format=auto[composed]`)
     }
     currentLabel = '[composed]'
   }
 
-  // Webcam PiP — only if the recording captured one and the user kept the
-  // toggle on in the editor. Sized in pixels relative to the *canvas*, then
-  // overlaid at the chosen corner / strip / full layout.
-  if (showCamera && session.webcamPath) {
-    let webcamAvailable = false
-    try {
-      await fs.access(session.webcamPath)
-      webcamAvailable = true
-    } catch {
-      onLog && onLog(`[processor] webcam.webm missing, skipping camera overlay\n`)
-    }
-    if (webcamAvailable) {
-      extraInputs.push('-i', session.webcamPath)
-      const camIdx = nextInputIdx++
-      const shortSide = Math.min(canvasW, canvasH)
-      const margin = Math.round(shortSide * 0.04)
-      const corner = Math.max(2, Math.round((shortSide * cameraSize) / 100))
-
-      let camW, camH, posX, posY, mask = false
-      if (cameraLayout === 'full') {
-        camW = canvasW; camH = canvasH; posX = 0; posY = 0
-      } else if (cameraLayout === 'bottom-strip') {
-        camH = Math.round(canvasH * 0.22)
-        camW = canvasW
-        posX = 0
-        posY = canvasH - camH
-      } else {
-        // Corner layouts. For circle we render square; for rect we keep 16:9.
-        if (cameraShape === 'circle') {
-          camW = corner; camH = corner; mask = true
-        } else {
-          camW = corner
-          camH = Math.round(corner * 9 / 16)
-        }
-        camW -= camW % 2
-        camH -= camH % 2
-        switch (cameraLayout) {
-          case 'tl': posX = margin; posY = margin; break
-          case 'tr': posX = canvasW - camW - margin; posY = margin; break
-          case 'bl': posX = margin; posY = canvasH - camH - margin; break
-          default:   posX = canvasW - camW - margin; posY = canvasH - camH - margin
-        }
-      }
-
-      // Build the cam preprocessing chain. We supersample 2× before masking
-      // so the circular alpha edge gets antialiased by the downscale, then
-      // feather the alpha by ~1.5 px for a softer rim. Without this the geq
-      // mask aliases hard pixel-stairs along the circle.
-      const flipPart = cameraFlip ? 'hflip,' : ''
-      const SS = 2 // supersample factor
-      const ssW = camW * SS
-      const ssH = camH * SS
-      const cropToFit = `scale=${ssW}:${ssH}:force_original_aspect_ratio=increase,crop=${ssW}:${ssH}`
-      let camChain = `[${camIdx}:v]${flipPart}${cropToFit}`
-      if (mask) {
-        const rOuter = ssW / 2
-        const rInner = rOuter - SS * 1.5 // 1.5-px feather at output scale
-        const cx = rOuter
-        const cy = rOuter
-        // Feathered alpha: 255 inside `rInner`, 0 outside `rOuter`, smooth in
-        // between. Implemented with clip(255 * (rOuter - dist) / feather).
-        const feather = rOuter - rInner
-        camChain +=
-          `,format=yuva420p,geq=` +
-          `r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':` +
-          `a='clip(255*((${rOuter}) - sqrt((X-${cx})*(X-${cx})+(Y-${cy})*(Y-${cy})))/${feather.toFixed(3)}, 0, 255)'`
-      }
-      // Downsample back to target size with a high-quality kernel.
-      camChain += `,scale=${camW}:${camH}:flags=lanczos[cam_pp]`
-      filterChain.push(camChain)
-
-      filterChain.push(
-        `${currentLabel}[cam_pp]overlay=x=${posX}:y=${posY}:format=auto[withcam]`
-      )
-      currentLabel = '[withcam]'
-      onLog && onLog(`[processor] camera overlay ${camW}×${camH} at (${posX},${posY}) layout=${cameraLayout}\n`)
-    }
-  }
-
-  // Watermark — applied on the inner stream (after cursor + camera, before
-  // bg framing) so it lives inside the inner clip exactly like the preview.
-  // Doing it after letterboxing made it sit on the wallpaper instead.
-  if (watermarkEnabled && watermarkText) {
-    const safeText = watermarkText
-      .replace(/\\/g, '\\\\')
-      .replace(/:/g, '\\:')
-      .replace(/'/g, "\\'")
-    const margin = Math.round(Math.min(W, H) * 0.04)
-    const xy = (() => {
-      switch (watermarkPosition) {
-        case 'top-left': return `x=${margin}:y=${margin}`
-        case 'top-right': return `x=w-tw-${margin}:y=${margin}`
-        case 'bottom-left': return `x=${margin}:y=h-th-${margin}`
-        default: return `x=w-tw-${margin}:y=h-th-${margin}`
-      }
-    })()
-    // Editor watermark size is in CSS px on a typical ~600-tall inner clip;
-    // scale to actual export height so it stays proportional.
-    const fontSize = Math.max(10, Math.round((watermarkSize / 600) * H))
-    const alpha = Math.max(0, Math.min(1, watermarkOpacity)).toFixed(2)
-    filterChain.push(
-      `${currentLabel}drawtext=text='${safeText}':fontcolor=white@${alpha}:fontsize=${fontSize}:${xy}:shadowcolor=black@0.5:shadowx=1:shadowy=1[wm]`
-    )
-    currentLabel = '[wm]'
-  }
-
-  // Keystroke overlay. We draw one drawtext per captured keydown event with
-  // an `enable` window matching the linger; multiple simultaneous keys are
-  // staggered horizontally via a slot allocator so they don't sit on top of
-  // each other.
-  if (showKeystrokes) {
-    const keys = (session.events || []).filter((e) => e.type === 'key')
-    // Translate event timestamps into output-timeline seconds, dropping any
-    // outside the trim window.
-    const trimmed = keys
-      .filter((k) => k.timestamp >= trimInMs && k.timestamp <= trimOutMs)
-      .map((k) => ({ ...k, tSec: (k.timestamp - trimInMs) / 1000 }))
-      .sort((a, b) => a.tSec - b.tSec)
-
-    if (trimmed.length > 0) {
-      const windowS = Math.max(0.1, keystrokeWindowMs / 1000)
-      // slotFreeAt[i] = earliest tSec at which slot i becomes available
-      const slotFreeAt = []
-      const SLOT_W = 90 // px between key chips
-      const fontSize = Math.max(20, Math.round(canvasH * 0.04))
-      const yExpr =
-        keystrokePosition === 'top'
-          ? `${Math.round(canvasH * 0.08)}`
-          : `h-th-${Math.round(canvasH * 0.08)}`
-
-      for (let kIdx = 0; kIdx < trimmed.length; kIdx++) {
-        const k = trimmed[kIdx]
-        // Find the lowest-indexed free slot; otherwise add a new one.
-        let slot = 0
-        while (slot < slotFreeAt.length && slotFreeAt[slot] > k.tSec) slot++
-        if (slot >= slotFreeAt.length) slotFreeAt.push(0)
-        slotFreeAt[slot] = k.tSec + windowS
-
-        // Symmetric layout: slots 0,1,2,3,4 → offsets 0, +SLOT_W, -SLOT_W, +2W, -2W
-        const half = Math.floor((slot + 1) / 2)
-        const sign = slot === 0 ? 0 : slot % 2 === 1 ? 1 : -1
-        const xOffset = sign * half * SLOT_W
-
-        // Render label with modifier glyphs prefixed.
-        const parts = []
-        if (k.meta) parts.push('CMD')
-        if (k.ctrl) parts.push('CTRL')
-        if (k.alt) parts.push('ALT')
-        if (k.shift && k.label.length > 1) parts.push('SHIFT')
-        parts.push(k.label.length === 1 ? k.label.toUpperCase() : k.label)
-        const text = parts.join(' ')
-          .replace(/\\/g, '\\\\')
-          .replace(/:/g, '\\:')
-          .replace(/'/g, "\\'")
-
-        const enableExpr = `between(t,${k.tSec.toFixed(3)},${(k.tSec + windowS).toFixed(3)})`
-        const xExpr = xOffset === 0
-          ? `(w-tw)/2`
-          : `(w-tw)/2${xOffset > 0 ? '+' : ''}${xOffset}`
-
-        // Include kIdx in the label so two simultaneous keys at the exact
-        // same `tSec.toFixed(3)` in the same slot don't collide on a label.
-        const kLabel = `k${kIdx}_${slot}_${k.tSec.toFixed(3).replace('.', '_')}`
-        filterChain.push(
-          `${currentLabel}drawtext=text='${text}':fontcolor=white:fontsize=${fontSize}:` +
-            `box=1:boxcolor=black@0.7:boxborderw=10:` +
-            `x='${xExpr}':y='${yExpr}':` +
-            `enable='${enableExpr}'[${kLabel}]`
-        )
-        currentLabel = `[${kLabel}]`
-      }
-      onLog && onLog(`[processor] keystroke overlay: ${trimmed.length} key chips\n`)
-    }
-  }
-
   filterChain.push(`${currentLabel}format=yuv420p[final]`)
 
-  // Audio chain: only built when audio isn't muted. We branch off the source
-  // audio stream (0:a) and apply volume + optional fades; the final filter
-  // graph adds an [aud] label that we map below.
+  // Audio chain. Source audio (mic / system) gets volume + fades; the
+  // optional click sound is a synthesized 1400 Hz burst (matches the preview
+  // WebAudio click) fanned out to every click timestamp via adelay and mixed
+  // on top without attenuating the source (normalize=0).
+  const clickTimes = cursorClickSound
+    ? (clickTimesMs || [])
+        .map((t) => (t - trimInMs) / 1000)
+        .filter((t) => t >= 0 && t < outDurSec)
+        .slice(0, 100)
+    : []
   const wantAudio = !audioMuted && probe.hasAudio
+  const wantClickAudio = !audioMuted && clickTimes.length > 0
   if (!probe.hasAudio) {
-    onLog && onLog('[processor] source has no audio stream; skipping audio chain\n')
+    onLog && onLog('[processor] source has no audio stream; skipping source audio chain\n')
   }
   if (wantAudio) {
     const fadeInS = Math.max(0, audioFadeInMs / 1000)
@@ -874,8 +926,42 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
       const startOut = Math.max(0, outDurSec - fadeOutS)
       parts.push(`afade=t=out:st=${startOut.toFixed(3)}:d=${fadeOutS.toFixed(3)}`)
     }
-    filterChain.push(parts.join(',') + '[aud]')
+    filterChain.push(parts.join(',') + (wantClickAudio ? '[amic]' : '[aud]'))
   }
+  if (wantClickAudio) {
+    extraInputs.push('-f', 'lavfi', '-i', 'sine=frequency=1400:duration=0.04:sample_rate=44100')
+    const clickInIdx = nextInputIdx++
+    const n = clickTimes.length
+    const shaped = 'volume=0.35,afade=t=out:st=0.005:d=0.03'
+    if (n === 1) {
+      const ms = Math.max(1, Math.round(clickTimes[0] * 1000))
+      filterChain.push(
+        `[${clickInIdx}:a]${shaped},adelay=${ms}|${ms},apad=whole_dur=${outDurSec.toFixed(3)}[clicks]`
+      )
+    } else {
+      const splitOuts = clickTimes.map((_, i) => `[ck${i}]`).join('')
+      filterChain.push(`[${clickInIdx}:a]${shaped},asplit=${n}${splitOuts}`)
+      const delayed = []
+      clickTimes.forEach((t, i) => {
+        const ms = Math.max(1, Math.round(t * 1000))
+        filterChain.push(`[ck${i}]adelay=${ms}|${ms}[ckd${i}]`)
+        delayed.push(`[ckd${i}]`)
+      })
+      filterChain.push(
+        `${delayed.join('')}amix=inputs=${n}:duration=longest:dropout_transition=0:normalize=0,` +
+          `apad=whole_dur=${outDurSec.toFixed(3)}[clicks]`
+      )
+    }
+    if (wantAudio) {
+      filterChain.push(
+        `[amic][clicks]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aud]`
+      )
+    } else {
+      filterChain.push(`[clicks]atrim=duration=${outDurSec.toFixed(3)}[aud]`)
+    }
+    onLog && onLog(`[processor] click sound: ${n} clicks mixed in\n`)
+  }
+  const mapAudio = wantAudio || wantClickAudio
 
   const filterComplex = filterChain.join(';')
   onLog && onLog(`[processor] filter_complex (${filterComplex.length} chars)\n`)
@@ -897,7 +983,7 @@ export async function processVideo(session, opts = {}, onProgress, onLog) {
     '-map',
     '[final]'
   ]
-  if (wantAudio) {
+  if (mapAudio) {
     args.push('-map', '[aud]', '-c:a', 'aac', '-b:a', '160k')
   } else {
     args.push('-an')

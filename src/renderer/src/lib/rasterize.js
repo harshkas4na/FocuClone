@@ -63,6 +63,31 @@ export async function rasterizeRoundedMask(width, height, radius) {
   return await blob.arrayBuffer()
 }
 
+// Drop shadow under the framed inner clip. The preview shows a CSS
+// box-shadow; the export previously had none — this bakes an equivalent
+// shadow into a transparent PNG the processor overlays beneath the clip.
+// Returns { buffer, w, h, pad } where pad is the margin around the w×h rect.
+export async function rasterizeFrameShadow(w, h, radius, blur, offsetY, alpha) {
+  const pad = Math.ceil(blur * 2 + Math.abs(offsetY))
+  const cw = w + pad * 2
+  const ch = h + pad * 2
+  const canvas = new OffscreenCanvas(cw, ch)
+  const ctx = canvas.getContext('2d')
+  ctx.clearRect(0, 0, cw, ch)
+  ctx.shadowColor = `rgba(0,0,0,${Math.max(0, Math.min(1, alpha))})`
+  ctx.shadowBlur = blur
+  ctx.shadowOffsetX = 0
+  ctx.shadowOffsetY = offsetY
+  // The filled rect is fully covered by the (same-size, same-radius) inner
+  // clip overlaid on top, so only the shadow spill is ever visible.
+  ctx.fillStyle = '#000000'
+  ctx.beginPath()
+  ctx.roundRect(pad, pad, w, h, radius)
+  ctx.fill()
+  const blob = await canvas.convertToBlob({ type: 'image/png' })
+  return { buffer: await blob.arrayBuffer(), w: cw, h: ch, pad }
+}
+
 // ----- Annotation rasterizer -----
 //
 // Each annotation gets drawn into a transparent canvas sized to its target

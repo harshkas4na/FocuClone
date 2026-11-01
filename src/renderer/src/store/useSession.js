@@ -10,7 +10,23 @@ function snapshot(state) {
   }
 }
 
-function pushHistory(state) {
+// Continuous gestures (dragging a zoom block, scrubbing a slider) emit one
+// update per mousemove. Pushing a history entry for each flooded the undo
+// stack — one drag ate all 50 slots and made ⌘Z useless. Coalesce: repeated
+// edits with the same key inside COALESCE_MS collapse into a single undo
+// step (the snapshot taken at the start of the burst).
+const COALESCE_MS = 800
+let lastHistKey = null
+let lastHistTime = 0
+
+function pushHistory(state, key = null) {
+  const now = Date.now()
+  if (key && key === lastHistKey && now - lastHistTime < COALESCE_MS) {
+    lastHistTime = now
+    return { future: [] }
+  }
+  lastHistKey = key
+  lastHistTime = now
   const next = [...state.past, snapshot(state)]
   if (next.length > HISTORY_LIMIT) next.shift()
   return { past: next, future: [] }
@@ -26,6 +42,11 @@ export const useSession = create((set, get) => ({
   cameraDeviceId: 'default',
   session: null,
   zooms: [],
+  // Which session the current zooms array was derived for. Editor only
+  // re-derives zooms from click events when this doesn't match session.id —
+  // otherwise remounting the Editor (e.g. Editor → Export → back) would
+  // clobber every manual zoom edit.
+  zoomsSessionId: null,
   selectedZoomId: null,
   trim: { inMs: 0, outMs: null }, // outMs=null → full duration
   annotations: [],
@@ -96,6 +117,11 @@ export const useSession = create((set, get) => ({
   },
   exportResult: null,
 
+  // True while a capture is in flight (countdown / recording / stopping).
+  // The Stepper locks navigation so the user can't abandon a live recorder.
+  recordingActive: false,
+  setRecordingActive: (recordingActive) => set({ recordingActive }),
+
   goto: (screen) => set({ screen }),
   setSource: (source) => set({ source }),
   setMicEnabled: (micEnabled) => set({ micEnabled }),
@@ -107,7 +133,13 @@ export const useSession = create((set, get) => ({
 
   // Initial zoom population from events should NOT push to history (it's the
   // "starting state" the user can return to via reset).
-  setZooms: (zooms) => set({ zooms, past: [], future: [] }),
+  setZooms: (zooms, sessionId) =>
+    set((s) => ({
+      zooms,
+      past: [],
+      future: [],
+      zoomsSessionId: sessionId !== undefined ? sessionId : s.zoomsSessionId
+    })),
   selectZoom: (selectedZoomId) => set({ selectedZoomId }),
 
   addZoom: (zoom) =>
@@ -124,7 +156,7 @@ export const useSession = create((set, get) => ({
     })),
   updateZoom: (id, patch) =>
     set((s) => ({
-      ...pushHistory(s),
+      ...pushHistory(s, `zoom:${id}`),
       zooms: s.zooms
         .map((z) => (z.id === id ? { ...z, ...patch } : z))
         .sort((a, b) => a.start - b.start)
@@ -132,7 +164,7 @@ export const useSession = create((set, get) => ({
 
   setTrim: (trim) =>
     set((s) => ({
-      ...pushHistory(s),
+      ...pushHistory(s, 'trim'),
       trim: { ...s.trim, ...trim }
     })),
 
@@ -152,7 +184,7 @@ export const useSession = create((set, get) => ({
     })),
   updateAnnotation: (id, patch) =>
     set((s) => ({
-      ...pushHistory(s),
+      ...pushHistory(s, `ann:${id}`),
       annotations: s.annotations.map((a) => (a.id === id ? { ...a, ...patch } : a))
     })),
   selectAnnotation: (selectedAnnotationId) => set({ selectedAnnotationId }),
@@ -183,6 +215,7 @@ export const useSession = create((set, get) => ({
       source: null,
       session: null,
       zooms: [],
+      zoomsSessionId: null,
       selectedZoomId: null,
       annotations: [],
       selectedAnnotationId: null,

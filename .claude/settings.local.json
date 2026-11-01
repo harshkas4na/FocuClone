@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run *)",
+      "Bash(gh repo *)",
+      "Bash(gh api *)",
+      "Bash(node -e \"import\\('./src/main/processor.js'\\).then\\(\\(\\)=>console.log\\('processor.js parses OK'\\)\\).catch\\(e=>{console.error\\(e.message\\);process.exit\\(1\\)}\\)\")",
+      "Bash(swiftc --version)",
+      "Bash(sw_vers)"
+    ]
+  }
+}
